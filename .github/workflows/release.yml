@@ -1,0 +1,76 @@
+name: Build & Release (Windows)
+
+# Build a Windows installer + portable EXE and publish a GitHub Release.
+# Triggers:
+#  - every push to main  → release tagged with the version in package.json
+#  - push of a v* tag    → release for that exact version (GitFlow-style)
+#  - manual run from the Actions tab
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build Windows EXE & publish release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build & package Windows app
+        run: npm run dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read app version
+        id: version
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts (CI copy)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CutClone-${{ steps.version.outputs.version }}-win-x64
+          path: |
+            release/*.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: CutClone v${{ steps.version.outputs.version }}
+          body: |
+            Tải về:
+            - **CutClone-Setup-*.exe** — bản cài đặt (khuyên dùng)
+            - **CutClone-Portable-*.exe** — bản chạy trực tiếp, không cần cài
+
+            Lưu ý: bản build chưa ký số (unsigned), Windows SmartScreen có thể
+            hiện cảnh báo lần đầu chạy — chọn "More info" → "Run anyway".
+          files: |
+            release/*.exe
+          make_latest: true
+          allowUpdates: true
+          replaces_artifacts: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

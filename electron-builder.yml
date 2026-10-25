@@ -1,0 +1,42 @@
+# electron-builder configuration — Windows build for CutClone (endyCut).
+# Run with: npm run dist  (uses electron-vite build output in out/)
+appId: com.huyendy.endycut
+productName: CutClone
+copyright: Copyright © 2026 HuyEndy
+
+directories:
+  output: release
+  buildResources: build
+
+# Only the built output and package metadata go into the app bundle.
+files:
+  - out/**
+  - "!**/*.map"
+  - package.json
+
+asar: true
+
+# mediabunny/WebCodecs run in-process; no native modules need rebuilding.
+npmRebuild: false
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+  # No code-signing certificate — Windows SmartScreen may warn on first run.
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: CutClone
+  artifactName: ${productName}-Setup-${version}.${ext}
+
+portable:
+  artifactName: ${productName}-Portable-${version}.${ext}
