@@ -2,10 +2,17 @@ import { useState } from 'react'
 import { FolderPlus, Plus, Trash2, Search } from 'lucide-react'
 import { useProjectStore } from '../../store/projectStore'
 import { useEditorStore } from '../../store/editorStore'
-import { importAssets } from '../../core/media/assets'
+import { analyzeAssetAudio, importAssets } from '../../core/media/assets'
 import { mediaUrlFor } from '../../core/media/assets'
 import { formatDuration } from '../../lib/format'
 import { EmptyLibraryHint } from '../layout/LeftPanel'
+
+/** Analyze audio + kick proxy jobs in the background; keeps import instant. */
+function postImportAnalysis(asset: { id: string; path: string; kind: string; duration: number }): void {
+  void analyzeAssetAudio(asset.id, asset.path, asset.kind as never, asset.duration, (id, fields) =>
+    useProjectStore.getState().patchAsset(id, fields)
+  )
+}
 
 export default function MediaLibrary() {
   const assets = useProjectStore((s) => s.doc.mediaLibrary)
@@ -22,7 +29,11 @@ export default function MediaLibrary() {
     setNotice(`Đang nhập ${paths.length} tệp…`)
     await importAssets(
       paths,
-      (asset) => addAssets([asset]),
+      (asset) => {
+        addAssets([asset])
+        postImportAnalysis(asset)
+        void useProjectStore.getState().ensureProxies()
+      },
       (path, err) => {
         console.warn('Import lỗi', path, err)
         setNotice(`Lỗi nhập: ${path.split(/[\\/]/).pop()}`)

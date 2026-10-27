@@ -23,6 +23,7 @@ let mainWindow: BrowserWindow | null = null
 const AUTO_SAVE_FILE = () => path.join(app.getPath('userData'), 'autosave.json')
 const RECENT_PROJECTS_FILE = () => path.join(app.getPath('userData'), 'recent-projects.json')
 const GENERATED_DIR = () => path.join(app.getPath('userData'), 'generated')
+const PROXY_DIR = () => path.join(app.getPath('userData'), 'proxy')
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -215,6 +216,40 @@ app.whenReady().then(() => {
     const safeName = (fileName || `gen-${Date.now()}.png`).replace(/[\\/:*?"<>|]/g, '-')
     const filePath = path.join(GENERATED_DIR(), safeName)
     await fsPromises.writeFile(filePath, Buffer.from(match[2], 'base64'))
+    return filePath
+  })
+
+  // Advanced color grading: pick + read an Adobe .cube LUT.
+  ipcMain.handle('color:pickLutPath', async () => {
+    if (!mainWindow) return null
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Nhập LUT (.cube)',
+      properties: ['openFile'],
+      filters: [{ name: 'LUT', extensions: ['cube'] }]
+    })
+    return result.canceled ? null : result.filePaths[0]
+  })
+
+  ipcMain.handle('color:readLut', async (_e, filePath: string) => {
+    if (!path.isAbsolute(filePath) || path.extname(filePath).toLowerCase() !== '.cube') {
+      throw new Error('Invalid LUT path')
+    }
+    return fsPromises.readFile(filePath, 'utf-8')
+  })
+
+  // Preview proxies: persist renderer-produced mp4 bytes under userData/proxy
+  // and return the path. Only used for smooth playback, never for export.
+  ipcMain.handle('media:writeProxy', async (_e, sourcePath: string, data: ArrayBuffer) => {
+    await fsPromises.mkdir(PROXY_DIR(), { recursive: true })
+    const id = path
+      .basename(sourcePath)
+      .toLowerCase()
+      .replace(/[^a-z0-9.+-]+/g, '_')
+      .slice(0, 48)
+    const filePath = path.join(PROXY_DIR(), `${id}.${Date.now()}.proxy.mp4`)
+    const buffer = Buffer.from(data as ArrayBuffer)
+    if (buffer.length === 0) throw new Error('Empty proxy payload')
+    await fsPromises.writeFile(filePath, buffer)
     return filePath
   })
 

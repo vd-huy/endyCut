@@ -1,6 +1,27 @@
 import { useProjectStore } from '../../store/projectStore'
 import { FILTER_PRESETS } from '../../lib/presets'
 import { NEUTRAL_FILTERS } from '@shared/document'
+import { EFFECT_CHIP_GRADIENT } from '../../lib/effectCatalog'
+import { sampleSceneDataUrl } from '../../lib/effectPreview'
+
+const FALLBACK_GRADIENT = EFFECT_CHIP_GRADIENT
+
+/** Tile thumbnail: illustrated scene under the actual CSS filter. */
+function FilterPreviewTile({ css }: { css: string }) {
+  const scene = sampleSceneDataUrl()
+  if (scene) {
+    return (
+      <img
+        src={scene}
+        alt=""
+        draggable={false}
+        className="h-16 w-full object-cover"
+        style={{ filter: css }}
+      />
+    )
+  }
+  return <div className="h-16 w-full" style={{ filter: css, background: FALLBACK_GRADIENT }} />
+}
 
 export default function EffectsPanel() {
   const selectedId = useProjectStore((s) => s.selection.clipId)
@@ -36,14 +57,7 @@ export default function EffectsPanel() {
               currentPreset === preset.id ? 'ring-2 ring-accent' : 'ring-ink-700 hover:ring-ink-400'
             }`}
           >
-            <div
-              className="h-16 w-full"
-              style={{
-                filter: preset.css,
-                background:
-                  'linear-gradient(135deg, #7c5cff 0%, #4f7cff 35%, #38bdf8 65%, #f0abfc 100%)'
-              }}
-            />
+            <FilterPreviewTile css={preset.css} />
             <p className="bg-ink-800 py-1 text-[11px] text-white">{preset.name}</p>
           </button>
         ))}

@@ -1,8 +1,8 @@
 {
-  "name": "cutclone",
-  "productName": "CutClone",
-  "version": "0.1.0",
-  "description": "Trình dựng video desktop — CapCut clone",
+  "name": "endyCut",
+  "productName": "EndyCut",
+  "version": "0.1.1",
+  "description": "Trình dựng video desktop — EndyCut",
   "main": "./out/main/index.js",
   "type": "module",
   "author": "HuyEndy",

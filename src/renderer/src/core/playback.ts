@@ -1,6 +1,6 @@
-import type { AudioEffectKind, Clip, MediaAsset, ProjectDocument } from '@shared/document'
-import { clipFadeMultiplier, clipSourceTime, sampleKeyframes, speedMultiplierAt } from '@shared/document'
-import { buildEffectNodes, PREVIEWABLE_EFFECTS } from './audio/audioEffects'
+import type { AudioEffectKind, Clip, MediaAsset, ProjectDocument, Track } from '@shared/document'
+import { clipFadeMultiplier, clipSourceTime, loudnessGain, sampleKeyframes, speedMultiplierAt } from '@shared/document'
+import { buildEffectNodes, ensurePitchNode, PITCH_SEMITONES, PREVIEWABLE_EFFECTS } from './audio/audioEffects'
 import { drawFrame, type DecodedFrame, type FrameMediaSource } from './render/frameRenderer'
 
 const RESYNC_THRESHOLD = 0.25
@@ -16,9 +16,7 @@ interface Entry {
   element: HTMLVideoElement | HTMLAudioElement | null
   image?: HTMLImageElement
   chain?: AudioChain
-}
-
-/**
+}/**
  * Owns HTML media elements and drives preview playback: a rAF loop advances
  * the playhead, keeps active elements in sync and repaints the canvas.
  */
@@ -119,14 +117,20 @@ export class PlaybackEngine {
     const clamped = Math.max(0, Math.min(time, documentDuration(this.doc)))
     this.onPlayhead(clamped)
     // Snap active elements immediately so scrubbing feels responsive.
-    for (const track of this.doc.tracks) {
-      for (const clip of track.clips) {
+    const visit = (clips: Clip[], owner: Clip | null): void => {
+      for (const clip of clips) {
+        if (clip.compound) {
+          for (const innerTrack of clip.compound.tracks) visit(innerTrack.clips, clip)
+          continue
+        }
         if (clip.kind === 'text') continue
-        const active = clamped >= clip.start && clamped < clip.start + clip.duration
-        const entry = this.entries.get(clip.id)
+        const key = owner ? `${owner.id}:${clip.id}` : clip.id
+        const localTime = owner ? clamped - owner.start : clamped
+        const active = localTime >= clip.start && localTime < clip.start + clip.duration
+        const entry = this.entries.get(key)
         if (!entry?.element) continue
         if (active) {
-          const target = clipSourceTime(clip, clamped)
+          const target = clipSourceTime(clip, localTime)
           if (Math.abs(entry.element.currentTime - target) > 0.05) {
             try {
               entry.element.currentTime = target
@@ -139,6 +143,7 @@ export class PlaybackEngine {
         }
       }
     }
+    for (const track of this.doc.tracks) visit(track.clips, null)
     if (redraw) this.tick()
   }
 
@@ -179,27 +184,47 @@ export class PlaybackEngine {
     return this.playheadGetter()
   }
 
-  private syncAndDraw(): void {
-    if (!this.ctx) return
+  /** Sync media elements for every asset-backed clip, incl. compound inners. */
+  private syncClips(liveClipIds: Set<string>): void {
     const time = this.onPlayheadCurrent()
-
-    const liveClipIds = new Set<string>()
-    for (const track of this.doc.tracks) {
-      for (const clip of track.clips) {
-        liveClipIds.add(clip.id)
+    const visitTrack = (track: Track, clips: Clip[], owner: Clip | null): void => {
+      for (const clip of clips) {
+        const key = owner ? `${owner.id}:${clip.id}` : clip.id
+        liveClipIds.add(key)
+        if (clip.compound) {
+          for (const innerTrack of clip.compound.tracks) {
+            visitTrack(innerTrack, innerTrack.clips, clip)
+          }
+          continue
+        }
         if (clip.kind === 'text' || !clip.assetId) continue
         const asset = this.doc.mediaLibrary.find((a) => a.id === clip.assetId)
         if (!asset) continue
-        const active = time >= clip.start && time < clip.start + clip.duration
+        const localTime = owner ? time - owner.start : time
+        const active = localTime >= clip.start && localTime < clip.start + clip.duration
+        const existing = this.entries.get(key)
         if (!active) {
-          const entry = this.entries.get(clip.id)
-          if (entry?.element && !entry.element.paused) entry.element.pause()
+          if (existing?.element && !existing.element.paused) existing.element.pause()
           continue
         }
-        const entry = this.ensureEntry(clip, asset)
-        this.syncElement(clip, track, entry, time)
+        if (owner && owner.transform.opacity === 0) continue // whole compound hidden
+        // The compound clip's own gain/fade wraps its inner clips' audio.
+        const extraVolume = owner
+          ? Math.max(0, Math.min(2, sampleKeyframes(owner, time).volume * clipFadeMultiplier(owner, time)))
+          : 1
+        const muted = owner ? false : (track.muted || track.hidden)
+        const entry = this.ensureEntry(key, clip, asset)
+        this.syncElement(clip, track, entry, localTime, asset, extraVolume, muted)
       }
     }
+    for (const track of this.doc.tracks) visitTrack(track, track.clips, null)
+  }
+
+  private syncAndDraw(): void {
+    if (!this.ctx) return
+
+    const liveClipIds = new Set<string>()
+    this.syncClips(liveClipIds)
 
     // Sweep entries whose clips disappeared from the document.
     for (const [key, entry] of this.entries) {
@@ -210,19 +235,33 @@ export class PlaybackEngine {
       }
     }
 
-    drawFrame(this.ctx, this.doc, time, this.playbackSource)
+    drawFrame(this.ctx, this.doc, this.onPlayheadCurrent(), this.playbackSource)
   }
 
-  private syncElement(clip: Clip, track: ProjectDocument['tracks'][number], entry: Entry, time: number): void {
+  private syncElement(
+    clip: Clip,
+    track: Track,
+    entry: Entry,
+    time: number,
+    asset: MediaAsset,
+    extraVolume = 1,
+    muted = track.muted
+  ): void {
     const el = entry.element
     if (!el) return
     const expected = clipSourceTime(clip, time)
     el.playbackRate = Math.min(16, Math.max(0.0625, speedMultiplierAt(clip, time)))
     const fade = clipFadeMultiplier(clip, time)
-    const audible = !track.muted && clip.kind !== 'image'
+    const audible = !muted && clip.kind !== 'image' && extraVolume > 0.001
     el.muted = !audible
     const keyframed = sampleKeyframes(clip, time)
-    el.volume = Math.min(1, Math.max(0, keyframed.volume * track.volume * fade))
+    el.volume = Math.min(
+      1,
+      Math.max(
+        0,
+        keyframed.volume * track.volume * fade * extraVolume * loudnessGain(asset, clip.audioNormalize)
+      )
+    )
     this.syncAudioChain(clip, el, entry, audible)
     if (this.playing) {
       if (Math.abs(el.currentTime - expected) > RESYNC_THRESHOLD) {
@@ -284,16 +323,39 @@ export class PlaybackEngine {
       source.connect(input)
       output.connect(this.audioCtx.destination)
       entry.chain = { effect: wanted, input: source, output, extra: nodes }
+      if (PITCH_SEMITONES[wanted]) void this.insertPitchWorklet(entry, wanted)
     } catch {
       // Element already routed once — leave it unprocessed rather than breaking audio.
       entry.chain = undefined
     }
   }
 
-  private ensureEntry(clip: Clip, asset: MediaAsset): Entry {
-    const existing = this.entries.get(clip.id)
+  /**
+   * Splice the granular AudioWorklet pitch shifter into a freshly built chain.
+   * Async because the worklet module compiles on first use; the entry is
+   * re-validated after the await so a changed effect doesn't get spliced in.
+   */
+  private async insertPitchWorklet(entry: Entry, effect: AudioEffectKind): Promise<void> {
+    const ctx = this.audioCtx
+    const chain = entry.chain
+    if (!ctx || !chain) return
+    const node = await ensurePitchNode(ctx, PITCH_SEMITONES[effect] ?? 0)
+    if (!node || this.audioCtx !== ctx) return
+    if (entry.chain !== chain) return
+    try {
+      chain.output.disconnect(ctx.destination)
+    } catch {
+      /* not connected */
+    }
+    chain.output.connect(node)
+    node.connect(ctx.destination)
+    chain.extra.push(node)
+  }
+
+  private ensureEntry(key: string, clip: Clip, asset: MediaAsset): Entry {
+    const existing = this.entries.get(key)
     if (existing) return existing
-    const url = mediaUrlOf(asset)
+    const url = mediaUrlOf(asset, clip.kind !== 'image')
     let entry: Entry
     if (clip.kind === 'image') {
       const img = new Image()
@@ -311,19 +373,19 @@ export class PlaybackEngine {
       video.playsInline = true
       entry = { element: video }
     }
-    this.entries.set(clip.id, entry)
+    this.entries.set(key, entry)
     return entry
   }
 
   private playbackSource: FrameMediaSource = {
     getFrame: (clip, asset, sourceTime): DecodedFrame | null => {
       if (clip.kind === 'image') {
-        const entry = this.ensureEntry(clip, asset)
+        const entry = this.ensureEntry(clip.id, clip, asset)
         const img = entry.image!
         if (!img.complete || img.naturalWidth === 0) return null
         return { image: img, width: img.naturalWidth, height: img.naturalHeight }
       }
-      const entry = this.ensureEntry(clip, asset)
+      const entry = this.ensureEntry(clip.id, clip, asset)
       const el = entry.element as HTMLVideoElement
       if (el.readyState < 2) return null
       return { image: el, width: el.videoWidth, height: el.videoHeight }
@@ -332,7 +394,7 @@ export class PlaybackEngine {
       if (clip.kind === 'image') {
         return this.playbackSource.getFrame(clip, asset, 0)
       }
-      const entry = this.ensureEntry(clip, asset)
+      const entry = this.ensureEntry(clip.id, clip, asset)
       const el = entry.element as HTMLVideoElement
       const end = clip.start + clip.duration - 0.06
       const target = clipSourceTime(clip, end)
@@ -354,11 +416,23 @@ export class PlaybackEngine {
 export function documentDuration(doc: ProjectDocument): number {
   let end = 0
   for (const track of doc.tracks) {
-    for (const clip of track.clips) end = Math.max(end, clip.start + clip.duration)
+    for (const clip of track.clips) {
+      if (clip.compound) {
+        // Nested clips extend their own bound; count them too.
+        for (const inner of clip.compound.tracks) {
+          for (const ic of inner.clips) end = Math.max(end, clip.start + ic.start + ic.duration)
+        }
+      }
+      end = Math.max(end, clip.start + clip.duration)
+    }
   }
   return end
 }
 
-function mediaUrlOf(asset: MediaAsset): string {
+function mediaUrlOf(asset: MediaAsset, preferProxy = false): string {
+  // Preview-only: a generated proxy file scrubs far smoother on heavy 4K+.
+  if (preferProxy && asset.kind === 'video' && asset.proxyPath) {
+    return `media://local?f=${encodeURIComponent(asset.proxyPath)}`
+  }
   return `media://local?f=${encodeURIComponent(asset.path)}`
 }

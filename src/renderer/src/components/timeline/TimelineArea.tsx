@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  Activity,
   Eye,
   EyeOff,
   Flag,
@@ -15,7 +16,8 @@ import {
 } from 'lucide-react'
 import { useEditorStore } from '../../store/editorStore'
 import { useProjectStore } from '../../store/projectStore'
-import type { Clip, ClipEffect, Track } from '@shared/document'
+import type { Clip, ClipEffect, Keyframe, KeyframeEasing, Track } from '@shared/document'
+import { applyEasing, sampleKeyframes } from '@shared/document'
 import { collectSnapCandidates, snapTime } from '@shared/timelineMath'
 import { formatTime } from '../../lib/format'
 import { IconButton } from '../ui/controls'
@@ -48,6 +50,7 @@ export default function TimelineArea() {
   const playhead = useEditorStore((s) => s.playhead)
   const setPlayhead = useEditorStore((s) => s.setPlayhead)
   const setPlaying = useEditorStore((s) => s.setPlaying)
+  const keyframePanelOpen = useEditorStore((s) => s.keyframePanel.open)
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const lanesRef = useRef<HTMLDivElement>(null)
@@ -296,6 +299,14 @@ export default function TimelineArea() {
         <IconButton title="Thêm mốc đánh dấu tại playhead (M)" onClick={addMarkerAtPlayhead}>
           <Flag size={14} />
         </IconButton>
+        <IconButton
+          title="Đồ thị keyframe (chỉnh đường cong)"
+          disabled={!selectedClipId}
+          active={keyframePanelOpen}
+          onClick={() => useEditorStore.getState().toggleKeyframePanel(selectedClipId)}
+        >
+          <Activity size={14} />
+        </IconButton>
         <div className="mx-1 h-5 w-px bg-ink-700" />
         <IconButton title="Thêm track video" onClick={() => useProjectStore.getState().addTrack('video')}>
           <Plus size={14} />
@@ -395,6 +406,15 @@ export default function TimelineArea() {
                 </div>
               ))}
 
+              {/* Marker guide lines through the lanes (beats included) */}
+              {doc.markers.map((m) => (
+                <div
+                  key={`guide-${m.id}`}
+                  className="pointer-events-none absolute top-0 z-0 h-full w-px opacity-60"
+                  style={{ left: m.time * pxPerSecond, background: m.color }}
+                />
+              ))}
+
               {/* Playhead line */}
               <PlayheadLine pps={pxPerSecond} playhead={playhead} onSeek={seek} />
               {snapLine !== null && (
@@ -411,6 +431,7 @@ export default function TimelineArea() {
       {contextMenu && (
         <ClipContextMenu {...contextMenu} onClose={() => setContextMenu(null)} />
       )}
+      {keyframePanelOpen && <KeyframeGraphPanel />}
     </section>
   )
 }
@@ -634,6 +655,12 @@ function ClipView({
         </div>
       )}
 
+      {/* Keyframe diamonds (selected clip) — click to seek, drag to move */}
+      {primary &&
+        clip.keyframes.map((kf) => (
+          <KeyframeDiamond key={kf.id} clip={clip} kf={kf} pps={pps} />
+        ))}
+
       {/* Trim handles */}
       <div
         className="absolute left-0 top-0 h-full w-1.5 cursor-w-resize bg-white/0 hover:bg-white/40"
@@ -676,6 +703,59 @@ function ClipView({
           </div>
         ))}
     </div>
+  )
+}
+
+/** Diamond marker on the clip: click seeks, horizontal drag re-times it. */
+function KeyframeDiamond({
+  clip,
+  kf,
+  pps
+}: {
+  clip: Clip
+  kf: Keyframe
+  pps: number
+}) {
+  const drag = useRef(false)
+  const playhead = useEditorStore((s) => s.playhead)
+  const active = Math.abs(playhead - (clip.start + kf.time)) < 0.04
+  const round = (v: number) => Math.round(v * 100) / 100
+
+  const timelineFromPointer = (clientX: number): number => {
+    const lanes = document.querySelector<HTMLElement>('[data-lanes="true"]')
+    if (!lanes) return clip.start
+    return (clientX - lanes.getBoundingClientRect().left) / pps
+  }
+
+  return (
+    <button
+      title={`Keyframe ${formatTime(kf.time)} — kéo để đổi thời điểm, nhấp để nhảy tới`}
+      className="absolute z-20 flex h-4 w-4 -translate-x-1/2 cursor-ew-resize items-center justify-center"
+      style={{ left: kf.time * pps, top: 1 }}
+      onPointerDown={(e) => {
+        e.stopPropagation()
+        drag.current = true
+        useProjectStore.getState().pushHistory()
+        useEditorStore.getState().setPlaying(false)
+        useEditorStore.getState().setPlayhead(clip.start + kf.time)
+        ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+      }}
+      onPointerMove={(e) => {
+        if (!drag.current) return
+        const local = Math.max(0, Math.min(clip.duration, timelineFromPointer(e.clientX) - clip.start))
+        useProjectStore.getState().updateKeyframe(clip.id, kf.id, { time: round(local) })
+      }}
+      onPointerUp={(e) => {
+        drag.current = false
+        ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
+      }}
+    >
+      <span
+        className={`h-2.5 w-2.5 rotate-45 rounded-[1px] border ${
+          active ? 'border-white bg-white' : 'border-amber-200/80 bg-amber-300'
+        }`}
+      />
+    </button>
   )
 }
 
@@ -775,7 +855,49 @@ function ClipContextMenu({
     { label: 'Sao chép (Ctrl+C)', action: () => project.copySelection() },
     { label: 'Nhân đôi', action: () => project.duplicateClip(clipId) }
   ]
-  if (clipKind === 'video') {
+  if (found.clip.compound) {
+    items.push({
+      label: 'Tách clip ghép (compound)',
+      action: () => {
+        if (!project.ungroupCompound(clipId)) window.alert('Không tách được clip ghép.')
+      }
+    })
+  } else if (clipKind === 'video') {
+    const selectionIds = project.selection.clipIds.length > 0 ? project.selection.clipIds : [clipId]
+    if (selectionIds.length >= 2) {
+      items.push({
+        label: `Gộp thành compound (${selectionIds.length} clip)`,
+        action: () => {
+          const id = project.groupIntoCompound(selectionIds)
+          if (!id) window.alert('Không gộp được: cần ≥ 2 clip thường và không lồng nhau.')
+        }
+      })
+    }
+    items.push({
+      label: 'Đảo ngược video',
+      action: () => {
+        void project.reverseClip(clipId).then((ok) => {
+          if (!ok) window.alert('Không đảo ngược được clip này.')
+        })
+      }
+    })
+    if (found.clip.assetId) {
+      const asset = project.findAsset(found.clip.assetId)
+      if (asset?.beats && asset.beats.length > 0) {
+        items.push({
+          label: `Đánh dấu beat (${asset.beats.length} nhịp)`,
+          action: () => {
+            const count = project.addBeatMarkers(found.clip.assetId!)
+            if (count === 0) window.alert('Không có beat mới để đánh dấu.')
+          }
+        })
+      }
+    }
+    if (project.doc.markers.some((m) => m.label.startsWith('Beat'))) {
+      items.push({ label: 'Xóa tất cả marker beat', action: () => project.removeAllBeatMarkers() })
+    }
+  }
+  if (clipKind === 'video' && !found.clip.compound) {
     items.push({
       label: 'Tách âm thanh',
       action: () => {
@@ -808,6 +930,256 @@ function ClipContextMenu({
           {item.label}
         </button>
       ))}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Keyframe graph panel (CapCut curve editor)
+// ---------------------------------------------------------------------------
+
+const GRAPH_PROPS = [
+  { key: 'scale', label: 'Tỉ lệ', color: '#7dd3fc', min: 0, max: 4, baseline: 1, audio: false },
+  { key: 'x', label: 'X', color: '#f472b6', min: -1, max: 1, baseline: 0, audio: false },
+  { key: 'y', label: 'Y', color: '#fbbf24', min: -1, max: 1, baseline: 0, audio: false },
+  { key: 'rotation', label: 'Xoay', color: '#a78bfa', min: -180, max: 180, baseline: 0, audio: false },
+  { key: 'opacity', label: 'Mờ dần', color: '#e2e8f0', min: 0, max: 1, baseline: 1, audio: false },
+  { key: 'volume', label: 'Âm lượng', color: '#34d399', min: 0, max: 2, baseline: 1, audio: true }
+] as const
+
+type GraphPropKey = (typeof GRAPH_PROPS)[number]['key']
+
+const GRAPH_W = 336
+const GRAPH_H = 148
+const GRAPH_PAD_X = 26
+const GRAPH_PAD_Y = 16
+
+function KeyframeGraphPanel() {
+  const panelClipId = useEditorStore((s) => s.keyframePanel.clipId)
+  const fallbackClipId = useProjectStore((s) => s.selection.clipId)
+  const activeClipId = panelClipId ?? fallbackClipId
+  const closePanel = useEditorStore((s) => s.closeKeyframePanel)
+  const playhead = useEditorStore((s) => s.playhead)
+  const found = useProjectStore((s) => (activeClipId ? s.findClip(activeClipId) : null))
+
+  const [prop, setProp] = useState<GraphPropKey>('scale')
+  const [selectedKf, setSelectedKf] = useState<string | null>(null)
+  const svgRef = useRef<SVGSVGElement | null>(null)
+  const draggingKf = useRef<string | null>(null)
+
+  if (!found || !activeClipId) return null
+  const { clip } = found
+  const meta = GRAPH_PROPS.find((p) => p.key === prop)!
+  const duration = Math.max(0.001, clip.duration)
+
+  const xOf = (t: number) => GRAPH_PAD_X + (Math.max(0, Math.min(duration, t)) / duration) * (GRAPH_W - GRAPH_PAD_X - 8)
+  const yOf = (v: number) => {
+    const clamped = Math.max(meta.min, Math.min(meta.max, v))
+    return GRAPH_H - GRAPH_PAD_Y - ((clamped - meta.min) / (meta.max - meta.min)) * (GRAPH_H - GRAPH_PAD_Y * 2)
+  }
+
+  const pointToGraph = (clientX: number, clientY: number): { t: number; v: number } => {
+    const rect = svgRef.current!.getBoundingClientRect()
+    const gx = clientX - rect.left
+    const gy = clientY - rect.top
+    const t = ((gx - GRAPH_PAD_X) / (GRAPH_W - GRAPH_PAD_X - 8)) * duration
+    const v = meta.min + ((GRAPH_H - GRAPH_PAD_Y - gy) / (GRAPH_H - GRAPH_PAD_Y * 2)) * (meta.max - meta.min)
+    return { t: Math.max(0, Math.round(t * 100) / 100), v: Math.max(meta.min, Math.min(meta.max, Math.round(v * 100) / 100)) }
+  }
+
+  const points = clip.keyframes
+    .filter((kf) => kf[prop] !== undefined)
+    .sort((a, b) => a.time - b.time)
+
+  return (
+    <div className="fixed bottom-[17.6rem] right-4 z-40 w-[368px] rounded-xl border border-ink-600 bg-ink-900/95 p-3 shadow-2xl backdrop-blur">
+      <div className="mb-2 flex items-center justify-between">
+        <p className="text-xs font-semibold text-white">Đồ thị keyframe</p>
+        <button onClick={closePanel} className="text-ink-400 hover:text-white" title="Đóng">
+          ✕
+        </button>
+      </div>
+
+      {/* Property chips */}
+      <div className="mb-2 flex flex-wrap gap-1">
+        {GRAPH_PROPS.filter((p) => !p.audio || clip.kind === 'video' || clip.kind === 'audio').map((p) => (
+          <button
+            key={p.key}
+            onClick={() => setProp(p.key)}
+            className={`rounded bg-ink-800 px-2 py-0.5 text-[10px] hover:bg-ink-700 ${
+              prop === p.key ? 'font-semibold' : 'text-ink-300'
+            }`}
+            style={prop === p.key ? { color: p.color } : undefined}
+          >
+            {p.label}
+          </button>
+        ))}
+        <button
+          onClick={() => {
+            const store = useProjectStore.getState()
+            const local = Math.max(0, Math.min(clip.duration, playhead - clip.start))
+            const base = sampleKeyframes(clip, clip.start + local)
+            store.pushHistory()
+            store.addKeyframe(
+              clip.id,
+              prop === 'volume'
+                ? { time: local, volume: base.volume ?? clip.volume }
+                : {
+                    time: local,
+                    scale: base.scale ?? clip.transform.scale,
+                    x: base.x ?? clip.transform.x,
+                    y: base.y ?? clip.transform.y,
+                    rotation: base.rotation ?? clip.transform.rotation,
+                    opacity: base.opacity ?? clip.transform.opacity
+                  }
+            )
+          }}
+          className="rounded bg-accent/20 px-2 py-0.5 text-[10px] font-medium text-accent hover:bg-accent/30"
+        >
+          + Playhead
+        </button>
+      </div>
+
+      {/* Graph */}
+      <svg
+        ref={svgRef}
+        width={GRAPH_W}
+        height={GRAPH_H}
+        viewBox={`0 0 ${GRAPH_W} ${GRAPH_H}`}
+        className="cursor-crosshair rounded border border-ink-700 bg-ink-950"
+        onPointerMove={(e) => {
+          const id = draggingKf.current
+          if (!id || !points.some((kf) => kf.id === id)) return
+          const { t, v } = pointToGraph(e.clientX, e.clientY)
+          useProjectStore.getState().updateKeyframe(clip.id, id, { time: t, [prop]: v })
+        }}
+        onPointerUp={(e) => {
+          draggingKf.current = null
+          ;(e.target as HTMLElement).releasePointerCapture?.(e.pointerId)
+        }}
+        onDoubleClick={(e) => {
+          // Add a full keyframe at the clicked time (values from current state).
+          if (e.target !== e.currentTarget) return
+          const { t } = pointToGraph(e.clientX, e.clientY)
+          const store = useProjectStore.getState()
+          const base = sampleKeyframes(clip, clip.start + t)
+          store.pushHistory()
+          store.addKeyframe(
+            clip.id,
+            prop === 'volume'
+              ? { time: t, volume: base.volume ?? clip.volume }
+              : {
+                  time: t,
+                  scale: base.scale ?? clip.transform.scale,
+                  x: base.x ?? clip.transform.x,
+                  y: base.y ?? clip.transform.y,
+                  rotation: base.rotation ?? clip.transform.rotation,
+                  opacity: base.opacity ?? clip.transform.opacity
+                }
+          )
+        }}
+      >
+        {/* Baseline + frame */}
+        <line
+          x1={GRAPH_PAD_X - 12}
+          y1={yOf(meta.baseline)}
+          x2={GRAPH_W - 6}
+          y2={yOf(meta.baseline)}
+          stroke="#1e2a4a"
+          strokeWidth={1}
+        />
+        <line x1={GRAPH_PAD_X} y1={4} x2={GRAPH_PAD_X} y2={GRAPH_H - GRAPH_PAD_Y} stroke="#334155" strokeWidth={0.5} />
+        {/* Playhead position */}
+        {playhead >= clip.start && playhead <= clip.start + clip.duration && (
+          <line
+            x1={xOf(playhead - clip.start)}
+            y1={4}
+            x2={xOf(playhead - clip.start)}
+            y2={GRAPH_H - GRAPH_PAD_Y}
+            stroke="#ef4444"
+            strokeWidth={1}
+            strokeDasharray="3 3"
+          />
+        )}
+        {/* Curve with easing between consecutive keyframes */}
+        {points.length >= 2 &&
+          points.slice(0, -1).map((kf, i) => {
+            const next = points[i + 1]
+            const from = kf[prop]!
+            const to = next[prop]!
+            const steps = 14
+            const d: string[] = []
+            for (let s = 0; s <= steps; s++) {
+              const u = s / steps
+              const eased = applyEasing(u, kf.easing ?? 'ease-in-out')
+              const value = from + (to - from) * eased
+              const t = kf.time + (next.time - kf.time) * u
+              d.push(`${s === 0 ? 'M' : 'L'} ${xOf(t)} ${yOf(value)}`)
+            }
+            return <path key={kf.id} d={d.join(' ')} fill="none" stroke={meta.color} strokeWidth={1.5} />
+          })}
+        {/* Keyframe diamonds */}
+        {points.map((kf) => (
+          <circle
+            key={kf.id}
+            cx={xOf(kf.time)}
+            cy={yOf(kf[prop]!)}
+            r={kf.id === selectedKf ? 6 : 5}
+            fill={meta.color}
+            stroke={kf.id === selectedKf ? '#ffffff' : '#0f172a'}
+            strokeWidth={kf.id === selectedKf ? 2 : 1}
+            className="cursor-grab"
+            onPointerDown={(e) => {
+              e.stopPropagation()
+              setSelectedKf(kf.id)
+              draggingKf.current = kf.id
+              useProjectStore.getState().pushHistory()
+              useEditorStore.getState().setPlaying(false)
+              ;(e.target as Element).setPointerCapture(e.pointerId)
+            }}
+          />
+        ))}
+      </svg>
+
+      {/* Selected keyframe controls */}
+      {selectedKf && points.some((k) => k.id === selectedKf) ? (
+        <div className="mt-2 flex items-center gap-2">
+          <span className="text-[10px] text-ink-400">
+            {formatTime(points.find((k) => k.id === selectedKf)!.time)}
+          </span>
+          <select
+            value={points.find((k) => k.id === selectedKf)!.easing ?? 'ease-in-out'}
+            onChange={(e) => {
+              useProjectStore.getState().pushHistory()
+              useProjectStore
+                .getState()
+                .updateKeyframe(clip.id, selectedKf, { easing: e.target.value as KeyframeEasing })
+            }}
+            className="flex-1 rounded border border-ink-600 bg-ink-800 px-1 py-0.5 text-[10px] text-white outline-none"
+          >
+            <option value="ease-in-out">Mượt (mặc định)</option>
+            <option value="linear">Tuyến tính</option>
+            <option value="ease-in">Chậm vào</option>
+            <option value="ease-out">Chậm ra</option>
+            <option value="hold">Giữ (bước)</option>
+          </select>
+          <button
+            onClick={() => {
+              useProjectStore.getState().pushHistory()
+              useProjectStore.getState().removeKeyframe(clip.id, selectedKf)
+              setSelectedKf(null)
+            }}
+            className="rounded bg-ink-800 p-1 text-ink-400 hover:bg-ink-700 hover:text-red-400"
+            title="Xóa keyframe"
+          >
+            <Trash2 size={11} />
+          </button>
+        </div>
+      ) : (
+        <p className="mt-2 text-[10px] leading-relaxed text-ink-500">
+          Kéo kim cương để đổi thời điểm/giá trị; đúp nhấp vùng trống để thêm keyframe.
+        </p>
+      )}
     </div>
   )
 }

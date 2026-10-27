@@ -1,14 +1,19 @@
-import { Diamond, FlipHorizontal2, FlipVertical2, RotateCcw, Scissors, Snowflake, Sparkles, Trash2 } from 'lucide-react'
+import { Combine, Diamond, FlipHorizontal2, FlipVertical2, Music, RotateCcw, Save, Scissors, Snowflake, Sparkles, Trash2, Ungroup, Undo2 } from 'lucide-react'
+import { useMemo, useReducer, useRef, useState } from 'react'
 import { useEditorStore } from '../../store/editorStore'
 import { useProjectStore } from '../../store/projectStore'
 import {
   NEUTRAL_FILTERS,
   SPEED_CURVE_PRESETS,
   createChromaKey,
+  createColorAdvanced,
   createMask,
+  loudnessGain,
   type AudioEffectKind,
   type BlendMode,
   type Clip,
+  type ColorAdvanced,
+  type CurvePoint,
   type MaskShape,
   type TextAnimationKind
 } from '@shared/document'
@@ -16,6 +21,14 @@ import { Section, SliderRow } from '../ui/controls'
 import { FONT_FAMILIES, TRANSITION_TYPES } from '../../lib/presets'
 import { formatTime } from '../../lib/format'
 import { freezeFrameAtPlayhead } from '../../core/media/freezeFrame'
+import {
+  deleteAudioPreset,
+  deleteColorPreset,
+  loadAudioPresets,
+  loadColorPresets,
+  saveAudioPreset,
+  saveColorPreset
+} from '../../lib/userPresets'
 
 const BLEND_MODES: Array<{ id: BlendMode; name: string }> = [
   { id: 'normal', name: 'Bình thường' },
@@ -74,8 +87,10 @@ const TEXT_ANIMATIONS: Array<{ id: TextAnimationKind; name: string }> = [
 export default function Inspector() {
   const doc = useProjectStore((s) => s.doc)
   const selectedId = useProjectStore((s) => s.selection.clipId)
+  const selection = useProjectStore((s) => s.selection)
   const findClip = useProjectStore((s) => s.findClip)
   const found = selectedId ? findClip(selectedId) : null
+  const [reversing, setReversing] = useState(false)
 
   if (!found) {
     return (
@@ -110,6 +125,19 @@ export default function Inspector() {
   }
 
   const { clip } = found
+  const beatAsset = clip.assetId ? useProjectStore.getState().findAsset(clip.assetId) : null
+  const hasBeatMarkers = doc.markers.some((m) => m.label.startsWith('Beat'))
+
+  const reverseNow = async () => {
+    if (!clip.assetId || clip.compound || reversing) return
+    setReversing(true)
+    try {
+      const ok = await useProjectStore.getState().reverseClip(clip.id)
+      if (!ok) window.alert('Không đảo ngược được clip này.')
+    } finally {
+      setReversing(false)
+    }
+  }
 
   return (
     <aside className="w-72 shrink-0 overflow-y-auto border-l border-ink-700/60 bg-ink-900">
@@ -128,6 +156,7 @@ export default function Inspector() {
           <TransformSection clip={clip} />
           <KeyframeSection clip={clip} />
           <FilterSection clip={clip} />
+          <ColorAdvancedSection clip={clip} />
           <MaskSection clip={clip} />
           <ChromaKeySection clip={clip} />
           <BlendSection clip={clip} />
@@ -177,6 +206,64 @@ export default function Inspector() {
             >
               <Snowflake size={12} /> Đóng băng khung
             </button>
+          </div>
+        )}
+        {/* Compound, reverse, beats (CapCut Tier-1) */}
+        <div className="mt-2 flex gap-2">
+          {clip.compound ? (
+            <button
+              onClick={() => {
+                if (!useProjectStore.getState().ungroupCompound(clip.id)) {
+                  window.alert('Không tách được clip ghép.')
+                }
+              }}
+              className="flex flex-1 items-center justify-center gap-1 rounded-md bg-ink-800 py-1.5 text-[11px] text-ink-300 hover:bg-ink-700 hover:text-white"
+            >
+              <Ungroup size={12} /> Tách compound
+            </button>
+          ) : (
+            <button
+              disabled={selection.clipIds.length < 2}
+              onClick={() => {
+                const id = useProjectStore.getState().groupIntoCompound(selection.clipIds)
+                if (!id) window.alert('Không gộp được: cần ≥ 2 clip thường và không lồng nhau.')
+              }}
+              title="Chọn nhiều clip trên timeline rồi gộp thành một clip ghép"
+              className="flex-1 rounded-md bg-ink-800 py-1.5 text-[11px] text-ink-300 enabled:hover:bg-ink-700 enabled:hover:text-white disabled:opacity-40"
+            >
+              Gộp compound ({selection.clipIds.length})
+            </button>
+          )}
+          {clip.kind === 'video' && clip.assetId && !clip.compound && (
+            <button
+              disabled={reversing}
+              onClick={() => void reverseNow()}
+              title="Đảo ngược toàn bộ video (tạo asset mới)"
+              className="flex flex-1 items-center justify-center rounded-md bg-ink-800 py-1.5 text-[11px] text-ink-300 enabled:hover:bg-ink-700 enabled:hover:text-white disabled:opacity-40"
+            >
+              {reversing ? 'Đang đảo…' : 'Đảo ngược'}
+            </button>
+          )}
+        </div>
+        {(clip.kind === 'audio' || clip.kind === 'video') && beatAsset?.beats && beatAsset.beats.length > 0 && (
+          <div className="mt-2 flex items-center gap-2">
+            <button
+              onClick={() => {
+                const count = useProjectStore.getState().addBeatMarkers(clip.assetId!)
+                if (count === 0) window.alert('Không có beat mới để đánh dấu.')
+              }}
+              className="flex flex-1 items-center justify-center gap-1 rounded-md bg-ink-800 py-1.5 text-[11px] text-ink-300 hover:bg-ink-700 hover:text-white"
+            >
+              <Music size={12} /> Đánh dấu beat
+            </button>
+            {hasBeatMarkers && (
+              <button
+                onClick={() => useProjectStore.getState().removeAllBeatMarkers()}
+                className="rounded-md bg-ink-800 px-2 py-1.5 text-[11px] text-ink-400 hover:bg-ink-700 hover:text-white"
+              >
+                Xóa beat
+              </button>
+            )}
           </div>
         )}
       </Section>
@@ -453,8 +540,331 @@ function FilterSection({ clip }: { clip: Clip }) {
   )
 }
 
-function MaskSection({ clip }: { clip: Clip }) {
-  const mask = clip.mask ?? createMask()
+// ---------------------------------------------------------------------------
+// Advanced grading: RGB curves, three-way wheels, .cube LUT + user presets
+// ---------------------------------------------------------------------------
+
+const CURVE_DEFS: Array<{ key: 'master' | 'red' | 'green' | 'blue'; label: string; color: string }> = [
+  { key: 'master', label: 'Toàn bộ', color: '#ffffff' },
+  { key: 'red', label: 'R', color: '#ff5a5a' },
+  { key: 'green', label: 'G', color: '#4ade80' },
+  { key: 'blue', label: 'B', color: '#60a5fa' }
+]
+
+function ColorAdvancedSection({ clip }: { clip: Clip }) {
+  const adv = clip.colorAdvanced ?? createColorAdvanced()
+  const update = useProjectStore.getState().updateClip
+  const push = useProjectStore.getState().pushHistory
+  const [activeCurve, setActiveCurve] = useState<'master' | 'red' | 'green' | 'blue'>('master')
+  const [presetsVersion, bumpPresets] = useReducer((n: number) => n + 1, 0)
+  const presets = useMemo(() => loadColorPresets(), [presetsVersion])
+
+  const set = (patch: Partial<ColorAdvanced>) =>
+    update(clip.id, { colorAdvanced: { ...adv, ...patch } })
+
+  const lutKey = adv.enabled && adv.lutPath ? 'LUT' : ''
+
+  const pickLut = async () => {
+    push()
+    try {
+      const picked = await window.api.pickColorLutPath()
+      if (!picked) return
+      const text = await window.api.readColorLut(picked)
+      if (!text.trim().includes('LUT_3D_SIZE')) {
+        window.alert('File .cube không có bảng LUT 3D hợp lệ (thiếu LUT_3D_SIZE).')
+        return
+      }
+      const name = picked.replace(/\\/g, '/').split('/').pop() ?? 'LUT'
+      set({ lutPath: picked, lutName: name, enabled: true })
+    } catch (error) {
+      console.error(error)
+      set({ lutPath: null, lutName: null })
+    }
+  }
+
+  return (
+    <Section title="Chỉnh màu nâng cao">
+      <label className="flex items-center justify-between text-xs">
+        <span className="text-ink-300">Bật chỉnh nâng cao</span>
+        <input
+          type="checkbox"
+          checked={adv.enabled}
+          onChange={(e) => {
+            push()
+            set({ enabled: e.target.checked })
+          }}
+          className="accent-[#4f7cff]"
+        />
+      </label>
+      {adv.enabled && (
+        <>
+          <div className="flex gap-1 pt-1">
+            {CURVE_DEFS.map((c) => (
+              <button
+                key={c.key}
+                onClick={() => setActiveCurve(c.key)}
+                className="flex flex-1 items-center justify-center rounded bg-ink-800 py-1 text-[10px] hover:bg-ink-700"
+                style={{ color: activeCurve === c.key ? c.color : undefined }}
+              >
+                <span className={activeCurve !== c.key ? 'text-ink-300' : ''}>{c.label}</span>
+              </button>
+            ))}
+          </div>
+          <CurveEditor
+            curveKey={activeCurve}
+            color={CURVE_DEFS.find((c) => c.key === activeCurve)!.color}
+            points={adv[activeCurve] ?? null}
+            onCommitStart={push}
+            onChange={(pts) => set({ [activeCurve]: pts } as Partial<ColorAdvanced>)}
+          />
+          <p className="text-[10px] text-ink-500">
+            Nhấp để thêm điểm; đúp nhấp để xóa. {lutKey && <> LUT đã nhập {adv.lutName}.</>}
+          </p>
+          <div className="pt-1">
+            <p className="text-[11px] font-medium text-ink-300">Bánh xe màu (cặp vector)</p>
+            <div className="mt-1 grid grid-cols-3 gap-1">
+              {(
+                [
+                  ['lift', 'Điểm tối'],
+                  ['gamma', 'Trung bình'],
+                  ['gainWheel', 'Điểm sáng']
+                ] as Array<['lift' | 'gamma' | 'gainWheel', string]>
+              ).map(([key, label]) => (
+                <WheelEditor
+                  key={key}
+                  label={label}
+                  value={adv[key] ?? [0, 0, 0]}
+                  onCommitStart={push}
+                  onChange={(vec) => set({ [key]: vec } as Partial<ColorAdvanced>)}
+                />
+              ))}
+            </div>
+          </div>
+          <button
+            onClick={() => void pickLut()}
+            className="mt-1 w-full rounded bg-ink-800 py-1.5 text-[11px] text-ink-300 hover:bg-ink-700 hover:text-white"
+          >
+            {adv.lutPath ? `Đổi LUT (.cube): ${adv.lutName ?? ''}` : 'Nhập LUT (.cube)…'}
+          </button>
+          {adv.lutPath && (
+            <>
+              <SliderRow
+                label="Strength LUT"
+                value={adv.lutStrength ?? 1}
+                min={0}
+                max={1}
+                format={pct}
+                onCommitStart={push}
+                onChange={(v) => set({ lutStrength: v })}
+              />
+              <button
+                onClick={() => {
+                  push()
+                  set({ lutPath: null, lutName: null })
+                }}
+                className="text-left text-[10px] text-ink-500 hover:text-red-400"
+              >
+                Gỡ LUT
+              </button>
+            </>
+          )}
+        </>
+      )}
+      {/* User presets (localStorage) — CapCut "Lưu chỉnh màu" */}
+      <button
+        onClick={() => {
+          const name = (window.prompt('Tên preset màu', `Preset ${presets.length + 1}`) ?? '').trim()
+          if (!name) return
+          saveColorPreset(name, clip.filters, adv)
+          bumpPresets()
+        }}
+        className="mt-2 flex w-full items-center justify-center gap-1.5 rounded bg-ink-800 py-1.5 text-[11px] text-ink-300 hover:bg-ink-700 hover:text-white"
+      >
+        <Save size={12} /> Lưu preset màu
+      </button>
+      {presets.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {presets.map((preset) => (
+            <span
+              key={preset.id}
+              className="group flex items-center gap-0.5 rounded bg-ink-800 pl-2 pr-1 text-[10px] text-ink-200 hover:bg-ink-700"
+            >
+              <button
+                onClick={() => {
+                  push()
+                  useProjectStore.getState().updateFilters(clip.id, { ...preset.filters, presetId: null })
+                  update(clip.id, { colorAdvanced: { ...preset.colorAdvanced, enabled: true } })
+                }}
+                className="py-1"
+              >
+                {preset.name}
+              </button>
+              <button
+                onClick={() => {
+                  deleteColorPreset(preset.id)
+                  bumpPresets()
+                }}
+                className="pl-0.5 text-ink-500 opacity-0 transition-opacity group-hover:opacity-100 hover:text-red-400"
+                title="Xóa preset"
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+    </Section>
+  )
+}
+
+/** Small editable curve (0..1 × 0..1). Drag points, add on empty click. */
+function CurveEditor({
+  curveKey,
+  color,
+  points,
+  onChange,
+  onCommitStart
+}: {
+  curveKey: string
+  color: string
+  points: CurvePoint[] | null
+  onChange: (points: CurvePoint[]) => void
+  onCommitStart: () => void
+}) {
+  const S = 104
+  const spanRef = useRef<SVGSVGElement | null>(null)
+  const dragging = useRef<number | null>(null)
+  const list = [...(points ?? [])].sort((a, b) => a.t - b.t)
+  const path = list.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.t * S} ${S - p.v * S}`).join(' ')
+  const identity = list.length === 0
+
+  const clampPoint = (t: number, v: number): { t: number; v: number } => ({
+    t: Math.max(0, Math.min(1, t)),
+    v: Math.max(0, Math.min(1, v))
+  })
+
+  const localPointer = (e: React.PointerEvent<SVGSVGElement>) => {
+    const rect = spanRef.current!.getBoundingClientRect()
+    return clampPoint((e.clientX - rect.left) / rect.width, 1 - (e.clientY - rect.top) / rect.height)
+  }
+
+  return (
+    <div className="flex items-center gap-2 pt-1">
+      <svg
+        ref={spanRef}
+        width={S}
+        height={S}
+        viewBox={`0 0 ${S} ${S}`}
+        className="cursor-crosshair rounded border border-ink-600 bg-ink-950"
+        onPointerDown={(e) => {
+          if (e.button !== 0) return
+          const p = localPointer(e)
+          const hit = list.findIndex((q) => Math.abs(q.t * S - p.t * S) < 8 && Math.abs(S - q.v * S - (S - p.v * S)) < 8)
+          if (hit >= 0) {
+            dragging.current = hit
+            e.currentTarget.setPointerCapture(e.pointerId)
+            onCommitStart()
+          } else {
+            onCommitStart()
+            onChange([...list, p].sort((a, b) => a.t - b.t))
+          }
+        }}
+        onPointerMove={(e) => {
+          if (dragging.current === null) return
+          if (!list[dragging.current]) return
+          const p = localPointer(e)
+          const next = list.map((q, i) => (i === dragging.current ? p : q)).sort((a, b) => a.t - b.t)
+          onChange(next)
+        }}
+        onPointerUp={(e) => {
+          dragging.current = null
+          e.currentTarget.releasePointerCapture(e.pointerId)
+        }}
+        onPointerLeave={() => {
+          dragging.current = null
+        }}
+      >
+        <line x1={0} y1={S} x2={S} y2={0} stroke="#334155" strokeWidth={1} strokeDasharray="4 4" />
+        {identity && <line x1={0} y1={S} x2={S} y2={0} stroke={color} strokeWidth={1.5} />}
+        <path d={path} fill="none" stroke={color} strokeWidth={1.5} />
+        {list.map((p, i) => (
+          <circle
+            key={`pt-${curveKey}-${i}`}
+            data-testid={`curve-point-${curveKey}`}
+            cx={p.t * S}
+            cy={S - p.v * S}
+            r={4}
+            fill={color}
+            onDoubleClick={() => {
+              onCommitStart()
+              onChange(list.filter((_, j) => j !== i))
+            }}
+          />
+        ))}
+      </svg>
+      <div className="text-[10px] leading-relaxed text-ink-500">
+        {curveKey === 'master' ? 'Đường cong kênh sáng.' : 'Ý nghĩa: kéo điểm để bẻ màu theo kênh.'}
+      </div>
+    </div>
+  )
+}
+
+/** 2-D color wheel (2 sliders-as-dot). value = RGB offsets, y ↔ blue/yellow. */
+function WheelEditor({
+  label,
+  value,
+  onChange,
+  onCommitStart
+}: {
+  label: string
+  value: [number, number, number]
+  onChange: (value: [number, number, number]) => void
+  onCommitStart: () => void
+}) {
+  const S = 64
+  const ref = useRef<SVGSVGElement | null>(null)
+  const drag = useRef(false)
+  const round = (v: number) => Math.round(v * 100) / 100
+  return (
+    <div className="text-center">
+      <svg
+        ref={ref}
+        width={S}
+        height={S}
+        viewBox={`0 0 ${S} ${S}`}
+        className="cursor-crosshair rounded border border-ink-600 bg-ink-950"
+        onPointerDown={(e) => {
+          drag.current = true
+          onCommitStart()
+          e.currentTarget.setPointerCapture(e.pointerId)
+          const rect = ref.current!.getBoundingClientRect()
+          const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+          const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height))
+          onChange([round(x * 2 - 1), round((1 - y) * 2 - 1), round((((x - 0.5) + (0.5 - y)) * 0.8))])
+        }}
+        onPointerUp={(e) => {
+          drag.current = false
+          e.currentTarget.releasePointerCapture(e.pointerId)
+        }}
+      >
+        <defs>
+          <radialGradient id={`wheel-${label}`} cx="50%" cy="50%" r="65%">
+            <stop offset="0%" stopColor="#4f7cff" />
+            <stop offset="50%" stopColor="#4f7cff" stopOpacity="0.25" />
+            <stop offset="100%" stopColor="transparent" />
+          </radialGradient>
+        </defs>
+        <rect x={0} y={0} width={S} height={S} fill={`url(#wheel-${label})`} />
+        <line x1={S / 2} y1={0} x2={S / 2} y2={S} stroke="#334155" strokeWidth={0.5} />
+        <line x1={0} y1={S / 2} x2={S} y2={S / 2} stroke="#334155" strokeWidth={0.5} />
+        <circle cx={(value[0] + 1) / 2 * S} cy={(1 - (value[1] + 1) / 2) * S} r={3.5} fill="#fff" />
+      </svg>
+      <p className="text-[9px] text-ink-400">{label}</p>
+    </div>
+  )
+}
+
+function MaskSection({ clip }: { clip: Clip }) {  const mask = clip.mask ?? createMask()
   const update = useProjectStore.getState().updateClip
   const push = useProjectStore.getState().pushHistory
   const set = (patch: Partial<typeof mask>) => update(clip.id, { mask: { ...mask, ...patch } })
@@ -756,6 +1166,11 @@ function TransitionQuickSection({ clip }: { clip: Clip }) {
 function AudioSection({ clip }: { clip: Clip }) {
   const update = useProjectStore.getState().updateClip
   const push = useProjectStore.getState().pushHistory
+  const [presetsVersion, bumpPresets] = useReducer((n: number) => n + 1, 0)
+  const presets = useMemo(() => loadAudioPresets(), [presetsVersion])
+  const asset = clip.assetId ? useProjectStore.getState().findAsset(clip.assetId) : null
+  const normalizeActive = clip.audioNormalize === true
+  const estGain = loudnessGain(asset ?? undefined, normalizeActive)
   return (
     <Section title="Âm thanh">
       <SliderRow
@@ -769,6 +1184,78 @@ function AudioSection({ clip }: { clip: Clip }) {
       />
       <SliderRow label="Fade in" value={clip.fadeIn} min={0} max={Math.min(5, clip.duration / 2)} step={0.1} format={(v) => `${v.toFixed(1)}s`} onCommitStart={push} onChange={(v) => update(clip.id, { fadeIn: v })} />
       <SliderRow label="Fade out" value={clip.fadeOut} min={0} max={Math.min(5, clip.duration / 2)} step={0.1} format={(v) => `${v.toFixed(1)}s`} onCommitStart={push} onChange={(v) => update(clip.id, { fadeOut: v })} />
+      <label className="flex items-center justify-between text-xs">
+        <span className="text-ink-300">Chuẩn hóa âm lượng</span>
+        <input
+          type="checkbox"
+          checked={normalizeActive}
+          onChange={(e) => {
+            push()
+            update(clip.id, { audioNormalize: e.target.checked })
+          }}
+          className="accent-[#4f7cff]"
+        />
+      </label>
+      {normalizeActive && (
+        <p className="text-[10px] text-ink-500">
+          Hệ số áp dụng: {estGain >= 1 ? `+${(20 * Math.log10(estGain)).toFixed(1)} dB` : `${(20 * Math.log10(estGain)).toFixed(1)} dB`} — lấy từ RMS
+          của clip (CapCut "Loudness").
+          {!asset?.rms && ' Clip chưa có dữ liệu RMS nên hệ số là 1.'}
+        </p>
+      )}
+      {/* User audio presets (localStorage) */}
+      <button
+        onClick={() => {
+          const name = (window.prompt('Tên preset âm thanh', `Âm ${presets.length + 1}`) ?? '').trim()
+          if (!name) return
+          saveAudioPreset(name, {
+            id: clip.id,
+            name,
+            volume: clip.volume,
+            fadeIn: clip.fadeIn,
+            fadeOut: clip.fadeOut,
+            audioNormalize: normalizeActive,
+            audioEffect: clip.audioEffect ?? 'none'
+          })
+          bumpPresets()
+        }}
+        className="mt-1 flex w-full items-center justify-center gap-1.5 rounded bg-ink-800 py-1.5 text-[11px] text-ink-300 hover:bg-ink-700 hover:text-white"
+      >
+        <Save size={12} /> Lưu preset âm thanh
+      </button>
+      {presets.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {presets.map((preset) => (
+            <span key={preset.id} className="group flex items-center gap-0.5 rounded bg-ink-800 pl-2 pr-1 text-[10px] text-ink-200 hover:bg-ink-700">
+              <button
+                onClick={() => {
+                  push()
+                  update(clip.id, {
+                    volume: preset.volume,
+                    fadeIn: preset.fadeIn,
+                    fadeOut: preset.fadeOut,
+                    audioNormalize: preset.audioNormalize,
+                    audioEffect: preset.audioEffect
+                  })
+                }}
+                className="py-1"
+              >
+                {preset.name}
+              </button>
+              <button
+                onClick={() => {
+                  deleteAudioPreset(preset.id)
+                  bumpPresets()
+                }}
+                className="pl-0.5 text-ink-500 opacity-0 transition-opacity group-hover:opacity-100 hover:text-red-400"
+                title="Xóa preset"
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
     </Section>
   )
 }

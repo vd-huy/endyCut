@@ -18,6 +18,14 @@ export interface MediaAsset {
   thumbnail?: string
   /** Normalized peak values (0..1) for audio waveforms. */
   waveform?: number[]
+  /** Beat onsets in seconds (CapCut-style auto beat detection). */
+  beats?: number[]
+  /** Estimated tempo, BPM. */
+  bpm?: number
+  /** Long-term average RMS (0..1) — used for loudness normalization. */
+  rms?: number
+  /** Local half-resolution proxy created for smooth 4K preview. */
+  proxyPath?: string
   /** Original sample rate / channels for audio, informational. */
   sampleRate?: number
   channels?: number
@@ -142,6 +150,34 @@ export interface Keyframe {
   opacity?: number
   volume?: number
   easing?: KeyframeEasing
+}
+
+/** One control point of a RGB curve, normalized (t and v in 0..1). */
+export interface CurvePoint {
+  t: number
+  v: number
+}
+
+/**
+ * CapCut-style advanced color grading: RGB curves, three-way color wheels and
+ * an imported .cube LUT, applied after the basic color filters.
+ */
+export interface ColorAdvanced {
+  enabled: boolean
+  master?: CurvePoint[] | null
+  red?: CurvePoint[] | null
+  green?: CurvePoint[] | null
+  blue?: CurvePoint[] | null
+  /** Shadows tint offset, per channel -1..1 (color wheel fill). */
+  lift?: [number, number, number] | null
+  /** Midtones tint offset. */
+  gamma?: [number, number, number] | null
+  /** Highlights tint offset. */
+  gainWheel?: [number, number, number] | null
+  /** Absolute path of an imported .cube LUT. */
+  lutPath?: string | null
+  lutName?: string | null
+  lutStrength?: number
 }
 
 export interface Marker {
@@ -280,8 +316,12 @@ export interface Clip {
   volume: number // 0..2
   fadeIn: number // seconds
   fadeOut: number
+  /** Match the clip's perceived loudness (~RMS normalize, CapCut "Loudness"). */
+  audioNormalize?: boolean
   transform: Transform
   filters: ColorFilters
+  /** Advanced grading: curves / color wheels / LUT (CapCut "Curves & Wheels"). */
+  colorAdvanced?: ColorAdvanced
   transitionIn: Transition | null
   keyframes: Keyframe[]
   /** Canvas blend mode used when compositing this clip. */
@@ -296,6 +336,18 @@ export interface Clip {
   effects?: ClipEffect[]
   text?: TextStyle
   sticker?: StickerData
+  /** Nested mini-sequence (CapCut "compound clip"); renders as one clip. */
+  compound?: Compound
+}
+
+/**
+ * Compound clip payload: an inner document slice with its own tracks. Asia
+ * inner time domain starts at 0 and its length is `duration`. Inner clips are
+ * always rendered at speed 1.
+ */
+export interface Compound {
+  duration: number
+  tracks: Track[]
 }
 
 export interface Track {
@@ -699,7 +751,10 @@ export function normalizeDocument(input: ProjectDocument): ProjectDocument {
     ...input,
     markers: Array.isArray(input.markers) ? input.markers : [],
     settings: { ...input.settings },
-    mediaLibrary: input.mediaLibrary ?? [],
+    mediaLibrary: (input.mediaLibrary ?? []).map((a) => ({
+      ...a,
+      beats: Array.isArray(a.beats) ? a.beats : undefined
+    })),
     tracks: (input.tracks ?? []).map((track) => ({
       ...track,
       clips: (track.clips ?? []).map((clip) => ({
@@ -711,9 +766,120 @@ export function normalizeDocument(input: ProjectDocument): ProjectDocument {
         blendMode: clip.blendMode ?? 'normal',
         mask: clip.mask ?? { ...DEFAULT_MASK },
         chromaKey: clip.chromaKey ?? { ...DEFAULT_CHROMA_KEY },
-        audioEffect: clip.audioEffect ?? 'none'
+        audioEffect: clip.audioEffect ?? 'none',
+        audioNormalize: clip.audioNormalize ?? false,
+        colorAdvanced: clip.colorAdvanced ?? { enabled: false },
+        compound: clip.compound ?? undefined
       }))
     }))
   }
   return doc
+}
+
+/** Neutral advanced grading — applies nothing until enabled. */
+export function createColorAdvanced(partial: Partial<ColorAdvanced> = {}): ColorAdvanced {
+  return {
+    enabled: false,
+    master: null,
+    red: null,
+    green: null,
+    blue: null,
+    lift: [0, 0, 0],
+    gamma: [0, 0, 0],
+    gainWheel: [0, 0, 0],
+    lutPath: null,
+    lutName: null,
+    lutStrength: 1,
+    ...partial
+  }
+}
+
+/**
+ * Loudness normalization gain for a clip whose asset has a measured RMS.
+ * Target ≈ −23 dBFS RMS (0.07), capped so quiet/very loud sources stay sane
+ * and peaks remain below clipping using the waveform max.
+ */
+export function loudnessGain(asset: Pick<MediaAsset, 'rms' | 'waveform'> | undefined, enabled: boolean | undefined): number {
+  if (!enabled || !asset?.rms || asset.rms <= 0.0005) return 1
+  const TARGET_RMS = 0.07
+  let gain = TARGET_RMS / asset.rms
+  // Peak-safe: waveform stores normalized peaks; never lift past 0.95 peak.
+  let peak = 0.8
+  for (const v of asset.waveform ?? []) peak = Math.max(peak, v)
+  gain = Math.min(gain, 0.95 / peak, 6)
+  gain = Math.max(gain, 0.05)
+  return gain
+}
+
+/**
+ * Beat/tempo detection from a rough RMS envelope (values 0..1 sampled evenly).
+ * Onsets = energy jumps above an adaptive threshold; BPM from the median
+ * inter-onset interval. Returns null when the envelope is too flat.
+ */
+export function detectBeats(
+  envelope: number[],
+  samplesPerSecond: number,
+  minBpm = 60,
+  maxBpm = 220
+): { beats: number[]; bpm: number } | null {
+  const n = envelope.length
+  if (n < samplesPerSecond * 2 || samplesPerSecond <= 0) return null
+  // Pre-emphasis: keep the positive part of the energy difference.
+  const flux = new Float32Array(n)
+  for (let i = 1; i < n; i++) {
+    const d = envelope[i] - envelope[i - 1]
+    if (d > 0) flux[i] = d
+  }
+  // Threshold = mean of a +-1s window, times sensitivity.
+  const win = Math.max(2, Math.round(samplesPerSecond))
+  const minGap = Math.max(2, Math.round(samplesPerSecond * (60 / maxBpm) * 0.6))
+  const onsets: number[] = []
+  let last = -Infinity
+  for (let i = win; i < n - win; i++) {
+    let sum = 0
+    for (let j = i - win; j <= i + win; j++) sum += flux[j]
+    const mean = sum / (2 * win + 1)
+    if (flux[i] > mean * 2.2 && flux[i] > 0.012 && i - last >= minGap) {
+      // local maximum check within +-100ms
+      const r = Math.round(samplesPerSecond * 0.1)
+      let isPeak = true
+      for (let j = Math.max(0, i - r); j <= Math.min(n - 1, i + r); j++) {
+        if (flux[j] > flux[i]) {
+          isPeak = false
+          break
+        }
+      }
+      if (isPeak) {
+        onsets.push(i / samplesPerSecond)
+        last = i
+      }
+    }
+  }
+  if (onsets.length < 4) return null
+  // Median inter-onset interval → BPM candidates in range; snap to phase.
+  const gaps: number[] = []
+  for (let i = 1; i < onsets.length; i++) {
+    const g = onsets[i] - onsets[i - 1]
+    if (g > 0.15 && g < 2.5) gaps.push(g)
+  }
+  if (gaps.length < 3) return null
+  gaps.sort((a, b) => a - b)
+  const medianGap = gaps[Math.floor(gaps.length / 2)]
+  let bpm = 60 / medianGap
+  // Unroll tempo into the requested range (halving/doubling).
+  while (bpm < minBpm) bpm *= 2
+  while (bpm > maxBpm) bpm /= 2
+  bpm = Math.round(bpm * 10) / 10
+  // Grid of beats at the estimated tempo starting from the first onset.
+  const beatGrid: number[] = []
+  const step = 60 / bpm
+  const start = onsets[0]
+  for (let t = start; t < onsets[onsets.length - 1] + step; t += step) beatGrid.push(Math.round(t * 1000) / 1000)
+  return { beats: beatGrid, bpm }
+}
+
+/** True when playback of this asset would benefit from a proxy render. */
+export function needsProxy(asset: Pick<MediaAsset, 'width' | 'height' | 'kind'> | undefined): boolean {
+  if (!asset || asset.kind !== 'video') return false
+  return asset.width >= 3840 || asset.height >= 2160 || asset.width * asset.height >= 8_300_000
 }

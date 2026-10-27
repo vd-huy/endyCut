@@ -9,7 +9,8 @@ import PreviewArea from './components/preview/PreviewArea'
 import Inspector from './components/inspector/Inspector'
 import TimelineArea from './components/timeline/TimelineArea'
 import ExportModal from './components/ExportModal'
-import { importAssets } from './core/media/assets'
+import { analyzeAssetAudio, importAssets } from './core/media/assets'
+import { KEYMAP_ACTIONS, loadKeymap, matchKeymapAction } from './lib/keymap'
 
 export default function App() {
   const doc = useProjectStore((s) => s.doc)
@@ -72,61 +73,86 @@ export default function App() {
     })
   }, [])
 
-  // Keyboard shortcuts.
+  // Keyboard shortcuts — routed through the user keymap (see lib/keymap.ts).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement
       if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return
       const editor = useEditorStore.getState()
+      // The reference modal intercepts keys itself while capturing a binding.
+      if (editor.keymapOpen) return
       const project = useProjectStore.getState()
       const fps = project.doc.settings.fps
-      if (e.code === 'Space') {
-        e.preventDefault()
-        if (editor.playing) {
+      const map = loadKeymap()
+      const action = matchKeymapAction(e, map)
+      if (!action) {
+        // Keep the classic Backspace delete even without an explicit binding.
+        if (e.key === 'Backspace' && project.selection.clipId) project.deleteClip(project.selection.clipId)
+        return
+      }
+      const meta = KEYMAP_ACTIONS.find((m) => m.id === action)
+      if (meta?.prevent) e.preventDefault()
+      switch (action) {
+        case 'play-pause':
+          if (editor.playing) {
+            engine.pause()
+            editor.setPlaying(false)
+          } else {
+            engine.play()
+            editor.setPlaying(true)
+          }
+          break
+        case 'split':
+          splitAtPlayhead()
+          break
+        case 'delete':
+          if (project.selection.clipId) project.deleteClip(project.selection.clipId)
+          break
+        case 'undo':
+          project.undo()
+          break
+        case 'redo':
+          project.redo()
+          break
+        case 'save':
+          void saveProject()
+          break
+        case 'copy':
+          project.copySelection()
+          break
+        case 'paste':
+          project.pasteFromClipboard(editor.playhead)
+          break
+        case 'duplicate':
+          if (project.selection.clipId) project.duplicateClip(project.selection.clipId)
+          break
+        case 'marker-add':
+          project.addMarker(editor.playhead)
+          break
+        case 'step-back': {
           engine.pause()
           editor.setPlaying(false)
-        } else {
-          engine.play()
-          editor.setPlaying(true)
+          engine.seek(Math.max(0, editor.playhead - (e.shiftKey ? 1 : 1 / fps)))
+          break
         }
-      } else if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (project.selection.clipId) {
-          project.deleteClip(project.selection.clipId)
+        case 'step-forward': {
+          engine.pause()
+          editor.setPlaying(false)
+          engine.seek(editor.playhead + (e.shiftKey ? 1 : 1 / fps))
+          break
         }
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-        e.preventDefault()
-        if (e.shiftKey) project.redo()
-        else project.undo()
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
-        e.preventDefault()
-        project.redo()
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
-        e.preventDefault()
-        splitAtPlayhead()
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-        e.preventDefault()
-        void saveProject()
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
-        e.preventDefault()
-        project.copySelection()
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
-        e.preventDefault()
-        project.pasteFromClipboard(editor.playhead)
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd') {
-        e.preventDefault()
-        if (project.selection.clipId) project.duplicateClip(project.selection.clipId)
-      } else if (e.key.toLowerCase() === 'm') {
-        project.addMarker(editor.playhead)
-      } else if (e.key === 'ArrowLeft') {
-        engine.pause()
-        editor.setPlaying(false)
-        engine.seek(Math.max(0, editor.playhead - (e.shiftKey ? 1 : 1 / fps)))
-      } else if (e.key === 'ArrowRight') {
-        engine.pause()
-        editor.setPlaying(false)
-        engine.seek(editor.playhead + (e.shiftKey ? 1 : 1 / fps))
-      } else if (e.key === 'Home') {
-        engine.seek(0)
+        case 'goto-start':
+          engine.seek(0)
+          break
+        case 'export':
+          editor.setExportState({ open: true })
+          break
+        case 'toggle-snapping':
+          editor.toggleSnapping()
+          break
+        case 'open-keymap':
+          editor.setKeymapOpen(true)
+          break
       }
     }
     window.addEventListener('keydown', onKey)
@@ -146,9 +172,15 @@ export default function App() {
       setImportNotice(`Đang nhập ${paths.length} tệp…`)
       await importAssets(
         paths,
-        (asset) => useProjectStore.getState().addAssetsToLibrary([asset]),
+        (asset) => {
+          useProjectStore.getState().addAssetsToLibrary([asset])
+          void analyzeAssetAudio(asset.id, asset.path, asset.kind, asset.duration, (id, fields) =>
+            useProjectStore.getState().patchAsset(id, fields)
+          )
+        },
         (path, err) => console.warn('Import lỗi', path, err)
       )
+      void useProjectStore.getState().ensureProxies()
       setImportNotice(null)
     }
     const onDragOver = (e: DragEvent) => e.preventDefault()

@@ -3,6 +3,7 @@ import type {
   Clip,
   ClipEffect,
   ColorFilters,
+  Compound,
   Keyframe,
   Marker,
   MediaAsset,
@@ -14,17 +15,26 @@ import type {
   TextStyle
 } from '@shared/document'
 import {
+  clipSourceSpan,
+  clipTimelineTimeForSource,
   createClip,
   createProjectDocument,
   createSticker,
   createText,
   createTrack,
+  needsProxy,
   normalizeDocument,
   totalDuration
 } from '@shared/document'
 import { overlapsTrack, resolveDropStart, splitClip } from '@shared/timelineMath'
+import { ensureProxy } from '../core/media/assets'
+import { buildReversedMediaAsset } from '../core/media/reverse'
 
 const HISTORY_LIMIT = 60
+
+/** Module-level busy flags so repeated calls don't double-generate. */
+const proxyGeneration = new Set<string>()
+let reverseBusy = false
 
 interface Selection {
   clipId: string | null
@@ -92,6 +102,21 @@ interface ProjectState {
   addKeyframe(clipId: string, keyframe: Omit<Keyframe, 'id'>): void
   updateKeyframe(clipId: string, keyframeId: string, patch: Partial<Keyframe>): void
   removeKeyframe(clipId: string, keyframeId: string): void
+
+  // --- Tier-1 layer additions (CapCut parity) ----------------------------
+  /** Merge the selected clips into one nested compound clip. */
+  groupIntoCompound(clipIds: string[]): string | null
+  /** Unpack a compound clip back onto its own tracks. */
+  ungroupCompound(clipId: string): boolean
+  /** Patch asset metadata (beats, bpm, rms, proxyPath…). */
+  patchAsset(assetId: string, patch: Partial<MediaAsset>): void
+  /** Add green beat markers at every detected beat of this asset. */
+  addBeatMarkers(assetId: string): number
+  removeAllBeatMarkers(): void
+  /** Background-render preview proxies for heavy clips. */
+  ensureProxies(): Promise<void>
+  /** Render a reversed copy of a video clip (audio reversed as well). */
+  reverseClip(clipId: string): Promise<boolean>
 
   /** Create a new audio clip on an audio track that plays a video clip's sound. */
   extractAudio(clipId: string): boolean
@@ -720,6 +745,223 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       target.keyframes = target.keyframes.filter((k) => k.id !== keyframeId)
       return { doc, dirty: true }
     })
+  },
+
+  groupIntoCompound(clipIds) {
+    const ids = clipIds.filter((id) => id)
+    if (ids.length === 0) return null
+    const picked = ids.map((id) => get().findClip(id)).filter((f): f is NonNullable<typeof f> => !!f)
+    if (picked.length === 0) return null
+    if (picked.some((f) => f.clip.compound)) return null // no nested compounds
+    const minStart = Math.min(...picked.map((f) => f.clip.start))
+    const maxEnd = Math.max(...picked.map((f) => f.clip.start + f.clip.duration))
+    if (maxEnd - minStart < 0.2) return null
+
+    const innerVideo: Clip[] = []
+    const innerText: Clip[] = []
+    const innerAudio: Clip[] = []
+    for (const { clip } of picked) {
+      const inner: Clip = { ...clone(clip), start: clip.start - minStart }
+      if (clip.kind === 'text' || clip.kind === 'sticker') innerText.push(inner)
+      else if (clip.kind === 'audio') innerAudio.push(inner)
+      else innerVideo.push(inner)
+    }
+    const tracks: Track[] = []
+    if (innerVideo.length > 0) {
+      innerVideo.sort((a, b) => a.start - b.start)
+      tracks.push({ ...createTrack('video', 'Media'), clips: innerVideo })
+    }
+    if (innerText.length > 0) {
+      innerText.sort((a, b) => a.start - b.start)
+      tracks.push({ ...createTrack('text', 'Chữ'), clips: innerText })
+    }
+    if (innerAudio.length > 0) {
+      innerAudio.sort((a, b) => a.start - b.start)
+      tracks.push({ ...createTrack('audio', 'Âm thanh'), clips: innerAudio })
+    }
+    if (tracks.length === 0) return null
+
+    const hostTrack = picked[0].track
+    const removedIds = new Set(ids)
+    get().pushHistory()
+    const compoundClip = createClip({
+      kind: 'video',
+      start: minStart,
+      duration: maxEnd - minStart,
+      compound: { duration: maxEnd - minStart, tracks }
+    })
+    set((s) => {
+      const doc = clone(s.doc)
+      for (const track of doc.tracks) {
+        track.clips = track.clips.filter((c) => !removedIds.has(c.id))
+      }
+      const target =
+        doc.tracks.find((t) => t.id === hostTrack.id && !t.locked) ??
+        doc.tracks.find((t) => t.kind === 'video' && !t.locked)
+      if (!target) return {}
+      target.clips.push(compoundClip)
+      target.clips.sort((a, b) => a.start - b.start)
+      return { doc, selection: { clipId: compoundClip.id, clipIds: [compoundClip.id] } }
+    })
+    return compoundClip.id
+  },
+
+  ungroupCompound(clipId) {
+    const found = get().findClip(clipId)
+    if (!found || !found.clip.compound) return false
+    const compound = found.clip.compound
+    const base = found.clip.start
+    get().pushHistory()
+    set((s) => {
+      const doc = clone(s.doc)
+      // Remove the compound clip itself.
+      for (const track of doc.tracks) {
+        track.clips = track.clips.filter((c) => c.id !== clipId)
+      }
+      // Visual inner clips land on a fresh top video track; audio inners on
+      // a new bottom audio track — CapCut-style "tách các nhóm".
+      const visualClips: Clip[] = []
+      const audioClips: Clip[] = []
+      for (const innerTrack of compound.tracks) {
+        for (const inner of innerTrack.clips) {
+          const outer: Clip = { ...inner, start: base + inner.start }
+          if (inner.kind === 'audio') audioClips.push(outer)
+          else visualClips.push(outer)
+        }
+      }
+      if (visualClips.length > 0) {
+        visualClips.sort((a, b) => a.start - b.start)
+        const track = createTrack('video', `Video ${doc.tracks.filter((t) => t.kind === 'video').length + 1}`)
+        track.clips = visualClips
+        const insertIndex = doc.tracks.findIndex((t) => t.kind !== 'text')
+        doc.tracks.splice(Math.max(0, insertIndex), 0, track)
+      }
+      if (audioClips.length > 0) {
+        audioClips.sort((a, b) => a.start - b.start)
+        const track = createTrack('audio', `Âm thanh ${doc.tracks.filter((t) => t.kind === 'audio').length + 1}`)
+        track.clips = audioClips
+        doc.tracks.push(track)
+      }
+      return {
+        doc,
+        selection: audioClips.length === 0 && visualClips.length > 0
+          ? { clipId: visualClips[0].id, clipIds: visualClips.map((c) => c.id) }
+          : { clipId: null, clipIds: [] }
+      }
+    })
+    return true
+  },
+
+  patchAsset(assetId, patch) {
+    set((s) => ({
+      doc: {
+        ...s.doc,
+        mediaLibrary: s.doc.mediaLibrary.map((a) => (a.id === assetId ? { ...a, ...patch } : a))
+      },
+      dirty: true
+    }))
+  },
+
+  addBeatMarkers(assetId) {
+    const asset = get().findAsset(assetId)
+    if (!asset?.beats || asset.beats.length === 0) return 0
+    const existing = get().doc.markers.map((m) => Math.round(m.time * 100) / 100)
+    const positions: number[] = []
+    for (const track of get().doc.tracks) {
+      if (track.kind === 'text') continue
+      for (const clip of track.clips) {
+        if (clip.assetId !== assetId) continue
+        for (const beat of asset.beats) {
+          const source = clip.inPoint + beat
+          if (source > clip.inPoint + clipSourceSpan(clip) + 0.001) continue
+          const t = Math.round(clipTimelineTimeForSource(clip, source) * 100) / 100
+          if (!existing.includes(t) && !positions.includes(t)) positions.push(t)
+        }
+      }
+    }
+    if (positions.length === 0) return 0
+    positions.sort((a, b) => a - b)
+    get().pushHistory()
+    set((s) => ({
+      doc: {
+        ...s.doc,
+        markers: [
+          ...s.doc.markers,
+          ...positions.map((t, i) => ({
+            id: crypto.randomUUID(),
+            time: t,
+            label: `Beat ${i + 1}`,
+            color: '#22c55e'
+          }))
+        ].sort((a, b) => a.time - b.time),
+        modifiedAt: Date.now()
+      },
+      dirty: true
+    }))
+    return positions.length
+  },
+
+  removeAllBeatMarkers() {
+    const count = get().doc.markers.filter((m) => m.label.startsWith('Beat')).length
+    if (count === 0) return
+    get().pushHistory()
+    set((s) => ({
+      doc: {
+        ...s.doc,
+        markers: s.doc.markers.filter((m) => !m.label.startsWith('Beat')),
+        modifiedAt: Date.now()
+      },
+      dirty: true
+    }))
+  },
+
+  async ensureProxies() {
+    const heavy = get().doc.mediaLibrary.filter(
+      (a) => needsProxy(a) && !a.proxyPath && !proxyGeneration.has(a.id)
+    )
+    for (const asset of heavy) {
+      if (proxyGeneration.has(asset.id)) continue
+      proxyGeneration.add(asset.id)
+      try {
+        const proxyPath = await ensureProxy(asset)
+        if (proxyPath) {
+          get().patchAsset(asset.id, { proxyPath })
+        }
+      } catch {
+        /* best-effort */
+      } finally {
+        proxyGeneration.delete(asset.id)
+      }
+    }
+  },
+
+  async reverseClip(clipId) {
+    const found = get().findClip(clipId)
+    if (!found || !found.clip.assetId) return false
+    const asset = get().findAsset(found.clip.assetId)
+    if (!asset || asset.kind !== 'video') return false
+    if (reverseBusy) return false
+    reverseBusy = true
+    try {
+      const reversed = await buildReversedMediaAsset(asset)
+      if (!reversed) return false
+      get().pushHistory()
+      set((s) => {
+        const doc = clone(s.doc)
+        doc.mediaLibrary = [...doc.mediaLibrary, reversed]
+        const target = doc.tracks
+          .find((t) => t.id === found.track.id)!
+          .clips.find((c) => c.id === clipId)!
+        target.assetId = reversed.id
+        target.inPoint = 0
+        return { doc, dirty: true }
+      })
+      return true
+    } catch {
+      return false
+    } finally {
+      reverseBusy = false
+    }
   },
 
   addMarker(time, label) {

@@ -1,5 +1,6 @@
-import type { Clip, ClipEffect, EffectKind, Mask, MediaAsset, ProjectDocument, TextAnimationKind, Track } from '@shared/document'
+import type { Clip, ClipEffect, Compound, EffectKind, Mask, MediaAsset, ProjectDocument, TextAnimationKind, Track } from '@shared/document'
 import { clipFadeMultiplier, clipSourceTime, cssFilterString, sampleKeyframes } from '@shared/document'
+import { colorGrade } from '../color/colorGrade'
 
 const EMOJI_FONT = `'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji',sans-serif`
 
@@ -37,7 +38,7 @@ export interface EffectPassState {
 
 const EMPTY_EFFECTS: EffectPassState = { blurPx: 0, zoom: 1, dx: 0, dy: 0, passes: [] }
 
-function activeEffects(clip: Clip, time: number): EffectPassState {
+export function activeEffects(clip: Clip, time: number): EffectPassState {
   const list = clip.effects
   if (!list || list.length === 0) return EMPTY_EFFECTS
   const local = time - clip.start
@@ -283,7 +284,7 @@ function applyMask(target: CanvasRenderingContext2D, mask: Mask, W: number, H: n
 }
 
 /** Draw overlay / composite passes for the active effects of a clip. */
-function drawEffectPasses(
+export function drawEffectPasses(
   ctx: CanvasRenderingContext2D,
   clip: Clip,
   time: number,
@@ -488,6 +489,20 @@ function drawImageClip(
       sy = 0
       sw = keyed.width
       sh = keyed.height
+    }
+  }
+
+  // Advanced grading (curves / color wheels / .cube LUT) right after keying,
+  // on source pixels — before transform/mask. Gracefully skipped when WebGL2
+  // or the LUT aren't available.
+  if (clip.colorAdvanced?.enabled) {
+    const graded = colorGrade(image, sx, sy, sw, sh, clip.colorAdvanced)
+    if (graded) {
+      image = graded
+      sx = 0
+      sy = 0
+      sw = graded.width
+      sh = graded.height
     }
   }
 
@@ -761,14 +776,27 @@ export function drawFrame(
   time: number,
   source: FrameMediaSource
 ): void {
+  renderTracks(ctx, doc, time, source, true)
+}
+
+/** Core track walk shared by the top-level frame and compound-clip drawing. */
+function renderTracks(
+  ctx: CanvasRenderingContext2D,
+  doc: ProjectDocument,
+  time: number,
+  source: FrameMediaSource,
+  fillBg: boolean
+): void {
   const W = doc.settings.width
   const H = doc.settings.height
   ctx.save()
   ctx.setTransform(1, 0, 0, 1, 0, 0)
   ctx.globalAlpha = 1
   ctx.filter = 'none'
-  ctx.fillStyle = doc.settings.backgroundColor
-  ctx.fillRect(0, 0, W, H)
+  if (fillBg) {
+    ctx.fillStyle = doc.settings.backgroundColor
+    ctx.fillRect(0, 0, W, H)
+  }
 
   // Draw back layers first: the END of the tracks array is the bottom row.
   for (let ti = doc.tracks.length - 1; ti >= 0; ti--) {
@@ -962,6 +990,85 @@ function drawWithOverride(
   drawClipContent(ctx, doc, time, clip, source, extraAlpha)
 }
 
+/**
+ * Draw a compound (nested) clip: renders its inner tracks into a scratch
+ * canvas with a recursive track walk, then composites it like any media clip
+ * (keyframe transform, blend, mask, fade). Inner time runs 0..compound.duration.
+ */
+function drawCompoundClip(
+  ctx: CanvasRenderingContext2D,
+  clip: Clip,
+  doc: ProjectDocument,
+  time: number,
+  source: FrameMediaSource,
+  extraAlpha: number
+): void {
+  const compound = clip.compound as Compound
+  const W = doc.settings.width
+  const H = doc.settings.height
+  const innerTime = Math.min(compound.duration, Math.max(0, time - clip.start))
+  const keyframed = sampleKeyframes(clip, time)
+  const fade = clipFadeMultiplier(clip, time)
+  const alpha = keyframed.opacity * fade * extraAlpha
+  if (alpha <= 0.001) return
+
+  const scratch = getScratch(4, W, H)
+  const sctx = scratch.getContext('2d')!
+  sctx.setTransform(1, 0, 0, 1, 0, 0)
+  sctx.globalAlpha = 1
+  sctx.globalCompositeOperation = 'source-over'
+  sctx.filter = 'none'
+  sctx.clearRect(0, 0, W, H)
+  renderTracks(sctx, { ...doc, tracks: compound.tracks }, innerTime, source, false)
+
+  const transform = clip.transform
+  // Compounds scale/rotate as a whole; per-edge crop is not applied to inner
+  // content (inner clips can crop individually).
+  const fit = Math.max(0.05, keyframed.scale)
+  const dw = W * fit
+  const dh = H * fit
+  const cx = W / 2 + keyframed.x * W
+  const cy = H / 2 + keyframed.y * H
+
+  const mask = clip.mask
+  const needsMask = !!mask && mask.shape !== 'none'
+  const blend = clip.blendMode && clip.blendMode !== 'normal' ? clip.blendMode : null
+
+  const blit = (target: CanvasRenderingContext2D, src: HTMLCanvasElement) => {
+    target.save()
+    target.globalAlpha = alpha
+    if (blend) target.globalCompositeOperation = blend
+    target.translate(cx, cy)
+    target.rotate((keyframed.rotation * Math.PI) / 180)
+    target.scale(transform.flipX ? -1 : 1, transform.flipY ? -1 : 1)
+    try {
+      target.drawImage(src, -dw / 2, -dh / 2, dw, dh)
+    } catch {
+      // scratch not ready — skip
+    }
+    target.restore()
+  }
+
+  if (!needsMask) {
+    blit(ctx, scratch)
+    return
+  }
+  // Masking needs a second full-frame scratch to hold the transformed content.
+  const out = getScratch(5, W, H)
+  const octx = out.getContext('2d')!
+  octx.setTransform(1, 0, 0, 1, 0, 0)
+  octx.globalAlpha = 1
+  octx.globalCompositeOperation = 'source-over'
+  octx.filter = 'none'
+  octx.clearRect(0, 0, W, H)
+  blit(octx, scratch)
+  applyMask(octx, mask!, W, H, 6)
+  ctx.save()
+  ctx.globalAlpha = 1
+  ctx.drawImage(out, 0, 0)
+  ctx.restore()
+}
+
 function drawClipContent(
   ctx: CanvasRenderingContext2D,
   doc: ProjectDocument,
@@ -976,6 +1083,10 @@ function drawClipContent(
   }
   if (clip.kind === 'sticker') {
     drawStickerClip(ctx, clip, doc, time, extraAlpha)
+    return
+  }
+  if (clip.compound) {
+    drawCompoundClip(ctx, clip, doc, time, source, extraAlpha)
     return
   }
   const asset = clip.assetId ? doc.mediaLibrary.find((a) => a.id === clip.assetId) : null

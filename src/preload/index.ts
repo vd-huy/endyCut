@@ -55,6 +55,11 @@ export interface CutCloneApi {
   removeRecentProject(filePath: string): Promise<RecentProjectEntry[]>
   /** Persist a data-URL payload under userData/generated; returns the path. */
   writeDataFile(dataUrl: string, fileName: string): Promise<string>
+  /** Pick + read an Adobe .cube color LUT. */
+  pickColorLutPath(): Promise<string | null>
+  readColorLut(path: string): Promise<string>
+  /** Save a preview-proxy mp4 produced in the renderer; returns its path. */
+  writeProxy(sourcePath: string, data: ArrayBuffer): Promise<string>
   /** Offline Windows SAPI text-to-speech. */
   listTtsVoices(): Promise<TtsVoice[]>
   synthesizeSpeech(text: string, voice: string, rate: number): Promise<string>
@@ -101,6 +106,9 @@ const api: CutCloneApi = {
   addRecentProject: (filePath, name) => ipcRenderer.invoke('project:recentAdd', filePath, name),
   removeRecentProject: (filePath) => ipcRenderer.invoke('project:recentRemove', filePath),
   writeDataFile: (dataUrl, fileName) => ipcRenderer.invoke('data:writeFile', dataUrl, fileName),
+  pickColorLutPath: () => ipcRenderer.invoke('color:pickLutPath'),
+  readColorLut: (path) => ipcRenderer.invoke('color:readLut', path),
+  writeProxy: (sourcePath, data) => ipcRenderer.invoke('media:writeProxy', sourcePath, data),
   listTtsVoices: () => ipcRenderer.invoke('tts:listVoices'),
   synthesizeSpeech: (text, voice, rate) => ipcRenderer.invoke('tts:synthesize', text, voice, rate),
   pickSrtOpenPath: () => ipcRenderer.invoke('srt:pickOpenPath'),

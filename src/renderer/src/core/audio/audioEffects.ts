@@ -7,8 +7,100 @@ export const PREVIEWABLE_EFFECTS: ReadonlySet<AudioEffectKind> = new Set([
   'robot',
   'phone',
   'bass-boost',
+  'high-pitch',
+  'low-pitch',
   'noise-reduction'
 ])
+
+/**
+ * AudioWorklet source for the preview pitch shift: dual delay-line Doppler
+ * shifter with half-cycle equal-power crossfade — duration-preserving, cheap
+ * and good enough for monitoring. Mirrors `pitchShiftBuffer` quality-wise.
+ */
+const PITCH_WORKLET_SRC = `class PitchShifter extends AudioWorkletProcessor {
+  constructor() {
+    super()
+    this.size = Math.round(sampleRate * 0.06) // 60 ms delay sweep
+    this.rings = [new Float32Array(this.size), new Float32Array(this.size)]
+    this.delay = [0, 0.5] // tap phases in ring units (0..1)
+    this.write = 0
+    this.ratio = 1
+    this.gains = [0, 0]
+    this.port.onmessage = (e) => {
+      this.ratio = Math.max(0.25, Math.min(4, Math.pow(2, (e.data.semitones || 0) / 12)))
+    }
+  }
+  readTap(ringIndex, delayPhase) {
+    const D = this.size
+    const d = delayPhase * D
+    const i0 = Math.floor(d)
+    const frac = d - i0
+    const ring = this.rings[ringIndex]
+    const a = ring[(this.write - i0 + D) % D]
+    const b = ring[(this.write - i0 - 1 + 2 * D) % D]
+    return a + (b - a) * frac
+  }
+  process(inputs, outputs) {
+    const input = inputs[0]
+    const output = outputs[0]
+    if (!input || input.length === 0) {
+      output.forEach((ch) => ch.fill(0))
+      return true
+    }
+    const r = this.ratio
+    const D = this.size
+    const stereo = input.length > 1
+    for (let i = 0; i < output[0].length; i++) {
+      this.rings[0][this.write] = input[0][i] || 0
+      if (stereo) this.rings[1][this.write] = input[1][i] || 0
+      else this.rings[1][this.write] = input[0][i] || 0
+      // Two taps half a sweep apart; each fades out right at its wrap point
+      // so the ring discontinuity is masked (equal-power crossfade).
+      let left = 0
+      let right = 0
+      for (let tap = 0; tap < 2; tap++) {
+        const g = 0.5 - 0.5 * Math.cos(2 * Math.PI * this.delay[tap])
+        this.gains[tap] = g
+        left += this.readTap(0, this.delay[tap]) * g
+        right += this.readTap(1, this.delay[tap]) * g
+      }
+      output[0][i] = left
+      output[1][i] = right
+      this.write = (this.write + 1) % D
+      for (let tap = 0; tap < 2; tap++) {
+        this.delay[tap] += (1 - r) / D
+        if (this.delay[tap] >= 1) this.delay[tap] -= 1
+        if (this.delay[tap] < 0) this.delay[tap] += 1
+      }
+    }
+    return true
+  }
+}
+registerProcessor('pitch-shifter', PitchShifter)`
+
+let pitchModuleUrl: string | null = null
+
+/**
+ * Create the preview pitch-shift AudioWorkletNode for a context. The worklet
+ * module is compiled once per process; repeated calls only instantiate nodes.
+ * Returns null when AudioWorklet isn't available (caller plays unprocessed).
+ */
+export async function ensurePitchNode(
+  ctx: BaseAudioContext,
+  semitones: number
+): Promise<AudioWorkletNode | null> {
+  try {
+    if (!pitchModuleUrl) {
+      pitchModuleUrl = URL.createObjectURL(new Blob([PITCH_WORKLET_SRC], { type: 'application/javascript' }))
+    }
+    await ctx.audioWorklet.addModule(pitchModuleUrl)
+    const node = new AudioWorkletNode(ctx, 'pitch-shifter', { outputChannelCount: [2] })
+    node.port.postMessage({ semitones })
+    return node
+  } catch {
+    return null
+  }
+}
 
 /** Pitch presets, in semitones. */
 export const PITCH_SEMITONES: Partial<Record<AudioEffectKind, number>> = {

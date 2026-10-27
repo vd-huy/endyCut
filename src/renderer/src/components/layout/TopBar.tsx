@@ -5,6 +5,7 @@ import {
   House,
   Redo2,
   Save,
+  Settings,
   Undo2,
   Clapperboard,
   Circle
@@ -16,6 +17,7 @@ import { IconButton } from '../ui/controls'
 import { openProject, saveProject } from '../../App'
 import HomeModal from '../HomeModal'
 import RecordModal from '../RecordModal'
+import KeymapModal from './KeymapModal'
 
 const RATIOS: AspectRatio[] = ['16:9', '9:16', '1:1', '4:3', '21:9']
 
@@ -25,6 +27,8 @@ export default function TopBar() {
   const past = useProjectStore((s) => s.past.length)
   const future = useProjectStore((s) => s.future.length)
   const setExportOpen = useEditorStore((s) => s.setExportState)
+  const keymapOpen = useEditorStore((s) => s.keymapOpen)
+  const setKeymapOpen = useEditorStore((s) => s.setKeymapOpen)
   const [homeOpen, setHomeOpen] = useState(false)
   const [recordOpen, setRecordOpen] = useState(false)
 
@@ -63,6 +67,9 @@ export default function TopBar() {
 
       <IconButton title="Ghi màn hình / camera / giọng nói" onClick={() => setRecordOpen(true)}>
         <Circle size={14} className="text-red-400" fill="currentColor" />
+      </IconButton>
+      <IconButton title="Phím tắt (?)" onClick={() => setKeymapOpen(true)}>
+        <Settings size={15} />
       </IconButton>
 
       <select
@@ -107,6 +114,7 @@ export default function TopBar() {
 
       {homeOpen && <HomeModal onClose={() => setHomeOpen(false)} />}
       {recordOpen && <RecordModal onClose={() => setRecordOpen(false)} />}
+      {keymapOpen && <KeymapModal onClose={() => setKeymapOpen(false)} />}
     </header>
   )
 }

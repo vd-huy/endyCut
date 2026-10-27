@@ -21,6 +21,10 @@ interface EditorState {
   loop: boolean
   exportState: ExportState
   importNotice: string | null
+  /** Floating keyframe graph panel (CapCut curve editor). */
+  keyframePanel: { open: boolean; clipId: string | null }
+  /** Keyboard shortcut reference / editor modal. */
+  keymapOpen: boolean
 
   setPlaying(playing: boolean): void
   togglePlay(): void
@@ -31,6 +35,10 @@ interface EditorState {
   toggleLoop(): void
   setExportState(patch: Partial<ExportState>): void
   setImportNotice(notice: string | null): void
+  /** Toggle the graph panel for a clip; null closes it. */
+  toggleKeyframePanel(clipId: string | null): void
+  closeKeyframePanel(): void
+  setKeymapOpen(open: boolean): void
 }
 
 export const useEditorStore = create<EditorState>((set, get) => ({
@@ -49,6 +57,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     error: null
   },
   importNotice: null,
+  keyframePanel: { open: false, clipId: null },
+  keymapOpen: false,
 
   setPlaying: (playing) => set({ playing }),
   togglePlay: () => set({ playing: !get().playing }),
@@ -60,5 +70,14 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   toggleLoop: () => set({ loop: !get().loop }),
   setExportState: (patch) =>
     set((s) => ({ exportState: { ...s.exportState, ...patch } })),
-  setImportNotice: (importNotice) => set({ importNotice })
+  setImportNotice: (importNotice) => set({ importNotice }),
+  toggleKeyframePanel: (clipId) =>
+    set((s) => ({
+      keyframePanel:
+        s.keyframePanel.open && s.keyframePanel.clipId === clipId
+          ? { open: false, clipId: null }
+          : { open: true, clipId }
+    })),
+  closeKeyframePanel: () => set({ keyframePanel: { open: false, clipId: null } }),
+  setKeymapOpen: (keymapOpen) => set({ keymapOpen })
 }))

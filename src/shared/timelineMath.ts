@@ -1,4 +1,4 @@
-import type { Clip, Track } from './document'
+import type { Clip, Compound, Track } from './document'
 import { clipSourceSpan } from './document'
 
 /** Seconds a pixel maps to, given timeline zoom. */
@@ -93,15 +93,75 @@ export interface SplitResult {
   right: Clip
 }
 
+/**
+ * Split a compound's inner tracks around `local` (seconds into the compound).
+ * Clips crossing the cut are trimmed on both sides; everything else keeps its
+ * place (right-side clips shift by -local). Returns null when either side
+ * would be empty (no meaningful cut).
+ */
+function splitCompound(compound: Compound, local: number): { left: Compound; right: Compound } | null {
+  const leftTracks: Track[] = []
+  const rightTracks: Track[] = []
+  let anyLeft = false
+  let anyRight = false
+  for (const track of compound.tracks) {
+    const leftClips: Clip[] = []
+    const rightClips: Clip[] = []
+    for (const clip of track.clips) {
+      const end = clip.start + clip.duration
+      if (end <= local + 1e-6) {
+        leftClips.push(clip)
+        anyLeft = true
+      } else if (clip.start >= local - 1e-6) {
+        rightClips.push({ ...clip, start: clip.start - local })
+        anyRight = true
+      } else {
+        // Crossing the cut: hand the outside part to each side.
+        leftClips.push({ ...clip, duration: local - clip.start, fadeOut: 0 })
+        rightClips.push({
+          ...clip,
+          id: crypto.randomUUID(),
+          start: 0,
+          duration: end - local,
+          inPoint: clip.inPoint + (local - clip.start) * clip.speed,
+          fadeIn: 0,
+          transitionIn: null,
+          keyframes: clip.keyframes
+            .filter((k) => k.time > (local - clip.start))
+            .map((k) => ({ ...k, id: crypto.randomUUID(), time: k.time - (local - clip.start) }))
+        })
+        anyLeft = true
+        anyRight = true
+      }
+    }
+    if (leftClips.length > 0) leftTracks.push({ ...track, clips: leftClips })
+    if (rightClips.length > 0) rightTracks.push({ ...track, clips: rightClips })
+  }
+  if (!anyLeft || !anyRight || leftTracks.length === 0 || rightTracks.length === 0) return null
+  return {
+    left: { duration: local, tracks: leftTracks },
+    right: { duration: Math.max(0.05, compound.duration - local), tracks: rightTracks }
+  }
+}
+
 /** Split a clip at an absolute timeline time; returns null if outside. */
 export function splitClip(clip: Clip, atTime: number): SplitResult | null {
   const local = atTime - clip.start
   if (local <= 0.05 || local >= clip.duration - 0.05) return null
+  let leftCompound = clip.compound
+  let rightCompound = clip.compound
+  if (clip.compound) {
+    const parts = splitCompound(clip.compound, local)
+    if (!parts) return null
+    leftCompound = parts.left
+    rightCompound = parts.right
+  }
   const left: Clip = {
     ...clip,
     duration: local,
     fadeOut: 0,
     keyframes: clip.keyframes.filter((k) => k.time <= local),
+    compound: leftCompound,
     transform: { ...clip.transform, crop: { ...clip.transform.crop } },
     filters: { ...clip.filters }
   }
@@ -116,6 +176,7 @@ export function splitClip(clip: Clip, atTime: number): SplitResult | null {
     keyframes: clip.keyframes
       .filter((k) => k.time > local)
       .map((k) => ({ ...k, id: crypto.randomUUID(), time: k.time - local })),
+    compound: rightCompound,
     transform: { ...clip.transform, crop: { ...clip.transform.crop } },
     filters: { ...clip.filters }
   }

@@ -2,7 +2,26 @@ import { useState } from 'react'
 import { Search, Sparkles, X } from 'lucide-react'
 import { useProjectStore } from '../../store/projectStore'
 import { useEditorStore } from '../../store/editorStore'
-import { EFFECT_CATALOG, EFFECT_CATEGORIES, EFFECT_CHIP_GRADIENT } from '../../lib/effectCatalog'
+import { EFFECT_CATALOG, EFFECT_CATEGORIES, EFFECT_CHIP_GRADIENT, type EffectCatalogEntry } from '../../lib/effectCatalog'
+import { useEffectPreviewDataUrl } from '../../lib/effectPreview'
+
+/** CapCut-style tile: looping GIF preview once baked, gradient before that. */
+function EffectPreviewTile({ entry }: { entry: EffectCatalogEntry }) {
+  const gif = useEffectPreviewDataUrl(entry)
+  if (gif) {
+    return <img src={gif} alt={entry.name} className="h-14 w-full object-cover" draggable={false} />
+  }
+  return (
+    <div
+      className="h-14 w-full"
+      style={{
+        background: EFFECT_CHIP_GRADIENT,
+        filter: entry.chip.filter,
+        transform: entry.chip.transform
+      }}
+    />
+  )
+}
 
 export default function EffectsLibraryPanel() {
   const selectedId = useProjectStore((s) => s.selection.clipId)
@@ -107,14 +126,7 @@ export default function EffectsLibraryPanel() {
                   className="group overflow-hidden rounded-lg ring-1 ring-ink-700 transition-all hover:ring-accent disabled:opacity-40"
                   title={`${entry.name} — ${entry.kind}`}
                 >
-                  <div
-                    className="h-14 w-full"
-                    style={{
-                      background: EFFECT_CHIP_GRADIENT,
-                      filter: entry.chip.filter,
-                      transform: entry.chip.transform
-                    }}
-                  />
+                  <EffectPreviewTile entry={entry} />
                   <p className="truncate bg-ink-800 px-1 py-1 text-[10px] text-white">{entry.name}</p>
                 </button>
               ))}
