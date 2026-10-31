@@ -1,12 +1,15 @@
-import type { AudioEffectKind, Clip, MediaAsset, ProjectDocument, Track } from '@shared/document'
+import type { AudioEffectKind, Clip, DenoiseMode, MediaAsset, ProjectDocument, Track } from '@shared/document'
 import { clipFadeMultiplier, clipSourceTime, loudnessGain, sampleKeyframes, speedMultiplierAt } from '@shared/document'
 import { buildEffectNodes, ensurePitchNode, PITCH_SEMITONES, PREVIEWABLE_EFFECTS } from './audio/audioEffects'
+import { ensureDenoiseNode } from './audio/denoise'
 import { drawFrame, type DecodedFrame, type FrameMediaSource } from './render/frameRenderer'
 
 const RESYNC_THRESHOLD = 0.25
 
 interface AudioChain {
   effect: AudioEffectKind
+  /** Identity of the active denoise settings (null = off) — rebuilds when changed. */
+  denoiseKey: string | null
   input: MediaElementAudioSourceNode
   output: AudioNode
   extra: AudioNode[]
@@ -281,34 +284,18 @@ export class PlaybackEngine {
     }
   }
 
-  /** Route clips with previewable audio effects through a WebAudio chain. */
+  /** Route clips with previewable audio effects or denoise through WebAudio. */
   private syncAudioChain(clip: Clip, el: HTMLMediaElement, entry: Entry, audible: boolean): void {
-    const wanted = audible && PREVIEWABLE_EFFECTS.has(clip.audioEffect ?? 'none') ? clip.audioEffect : null
+    const effect = clip.audioEffect ?? 'none'
+    const denoise = clip.denoise
+    const denoiseKey = denoise?.enabled ? `${Math.round(denoise.rate * 100)}|${denoise.mode}` : null
+    const wanted = audible && (PREVIEWABLE_EFFECTS.has(effect) || denoiseKey) ? effect : null
     const chain = entry.chain
     if (!wanted) {
-      if (chain) {
-        try {
-          chain.input.disconnect()
-          chain.output.disconnect()
-          for (const node of chain.extra) node.disconnect()
-        } catch {
-          /* already torn down */
-        }
-        entry.chain = undefined
-      }
+      this.teardownChain(entry)
       return
     }
-    if (chain && chain.effect === wanted) return
-    if (chain) {
-      try {
-        chain.input.disconnect()
-        chain.output.disconnect()
-        for (const node of chain.extra) node.disconnect()
-      } catch {
-        /* ignore */
-      }
-      entry.chain = undefined
-    }
+    if (chain && chain.effect === wanted && chain.denoiseKey === denoiseKey) return
     if (!this.audioCtx) {
       try {
         this.audioCtx = new AudioContext()
@@ -318,38 +305,87 @@ export class PlaybackEngine {
     }
     if (this.audioCtx.state === 'suspended') void this.audioCtx.resume()
     try {
-      const source = this.audioCtx.createMediaElementSource(el)
+      // The element can only be routed once per document: reuse the existing
+      // MediaElementAudioSourceNode and rebuild only the effect sub-chain.
+      const source = chain?.input ?? this.audioCtx.createMediaElementSource(el)
+      if (chain) {
+        try {
+          chain.output.disconnect()
+        } catch {
+          /* ignore */
+        }
+        for (const node of chain.extra) {
+          try {
+            node.disconnect()
+          } catch {
+            /* ignore */
+          }
+        }
+      }
       const { nodes, input, output } = buildEffectNodes(this.audioCtx, wanted)
       source.connect(input)
       output.connect(this.audioCtx.destination)
-      entry.chain = { effect: wanted, input: source, output, extra: nodes }
-      if (PITCH_SEMITONES[wanted]) void this.insertPitchWorklet(entry, wanted)
+      entry.chain = { effect: wanted, denoiseKey, input: source, output, extra: nodes }
+      void this.insertWorklets(entry, wanted)
     } catch {
-      // Element already routed once — leave it unprocessed rather than breaking audio.
+      // Element already routed once and the old chain is gone — leave it
+      // unprocessed rather than breaking audio.
       entry.chain = undefined
     }
   }
 
+  private teardownChain(entry: Entry): void {
+    const chain = entry.chain
+    if (!chain) return
+    try {
+      chain.input.disconnect()
+      chain.output.disconnect()
+      for (const node of chain.extra) node.disconnect()
+    } catch {
+      /* already torn down */
+    }
+    entry.chain = undefined
+  }
+
   /**
-   * Splice the granular AudioWorklet pitch shifter into a freshly built chain.
-   * Async because the worklet module compiles on first use; the entry is
-   * re-validated after the await so a changed effect doesn't get spliced in.
+   * Splice the optional AudioWorklet inserts (granular pitch shifter for pitch
+   * effects, streaming denoiser) between the effect chain and the destination.
+   * Async because worklet modules compile on first use; the entry is
+   * re-validated after each await so a changed chain doesn't get spliced.
    */
-  private async insertPitchWorklet(entry: Entry, effect: AudioEffectKind): Promise<void> {
+  private async insertWorklets(entry: Entry, effect: AudioEffectKind): Promise<void> {
     const ctx = this.audioCtx
     const chain = entry.chain
     if (!ctx || !chain) return
-    const node = await ensurePitchNode(ctx, PITCH_SEMITONES[effect] ?? 0)
-    if (!node || this.audioCtx !== ctx) return
-    if (entry.chain !== chain) return
+    const inserts: AudioWorkletNode[] = []
+    if (PITCH_SEMITONES[effect]) {
+      const node = await ensurePitchNode(ctx, PITCH_SEMITONES[effect] ?? 0)
+      if (this.audioCtx !== ctx || entry.chain !== chain) return
+      if (node) inserts.push(node)
+    }
+    if (chain.denoiseKey) {
+      const [rate, mode] = chain.denoiseKey.split('|')
+      const node = await ensureDenoiseNode(ctx, {
+        enabled: true,
+        rate: Number(rate) / 100,
+        mode: mode as DenoiseMode
+      })
+      if (this.audioCtx !== ctx || entry.chain !== chain) return
+      if (node) inserts.push(node)
+    }
+    if (inserts.length === 0) return
     try {
       chain.output.disconnect(ctx.destination)
     } catch {
       /* not connected */
     }
-    chain.output.connect(node)
-    node.connect(ctx.destination)
-    chain.extra.push(node)
+    let prev: AudioNode = chain.output
+    for (const node of inserts) {
+      prev.connect(node)
+      prev = node
+      chain.extra.push(node)
+    }
+    prev.connect(ctx.destination)
   }
 
   private ensureEntry(key: string, clip: Clip, asset: MediaAsset): Entry {

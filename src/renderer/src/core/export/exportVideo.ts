@@ -21,8 +21,10 @@ import {
   speedMultiplierAt
 } from '@shared/document'
 import { buildEffectNodes, PITCH_SEMITONES, pitchShiftBuffer } from '../audio/audioEffects'
+import { denoiseBuffer } from '../audio/denoise'
 import { documentDuration } from '../playback'
 import { createIpcFileSource } from '../media/ipcSource'
+import { ensureStabilization } from '../media/stabilization'
 import { drawFrame, type FrameMediaSource } from '../render/frameRenderer'
 import { gifFrameCount, GifEncoder } from './gif'
 
@@ -155,6 +157,9 @@ function createSampleBus(doc: ProjectDocument): SampleBus {
         if (!hasVisualAsset(clip)) continue
         const asset = doc.mediaLibrary.find((a) => a.id === clip.assetId)
         if (!asset || asset.kind !== 'video') continue
+        // Stabilization must be ready before its frames render; the analysis
+        // is cached, so this is a no-op after the first pass.
+        if (clip.stabilization?.enabled) await ensureStabilization(clip, asset)
         const localTime = clipSourceTime(clip, time)
         const sink = await videoSinkFor(asset)
         if (!sink) continue
@@ -558,9 +563,15 @@ async function renderAudioTrack(
     }
     const pitch = PITCH_SEMITONES[effect] ?? 0
     const span = clipSourceSpan(clip)
+    const denoise = clip.denoise?.enabled ? clip.denoise : null
     try {
+      const chunks: Array<{ buffer: AudioBuffer; timestamp: number }> = []
       for await (const { buffer, timestamp } of sink.buffers(clip.inPoint, clip.inPoint + span)) {
         if (options.signal.aborted) throw new Error('__ABORTED__')
+        if (denoise) {
+          chunks.push({ buffer, timestamp })
+          continue
+        }
         // Map this decoded chunk's source position back to the timeline,
         // honoring speed ramps, and rate the chunk by the local speed.
         const timelineTime = clipTimelineTimeForSource(clip, timestamp)
@@ -570,6 +581,37 @@ async function renderAudioTrack(
         node.playbackRate.value = localSpeed
         node.connect(gain)
         node.start(timelineTime)
+      }
+      if (denoise && chunks.length > 0) {
+        // Noise reduction needs one continuous pass (shared noise floor), so
+        // the clip is decoded fully, denoised once, then scheduled per chunk
+        // with AudioBufferSourceNode's offset/duration preserving the mapping.
+        const first = chunks[0].buffer
+        const totalLen = chunks.reduce((n, c) => n + c.buffer.length, 0)
+        const full = offline.createBuffer(
+          Math.max(1, first.numberOfChannels),
+          Math.max(1, totalLen),
+          first.sampleRate
+        )
+        let offset = 0
+        const ranges: Array<{ timestamp: number; offset: number; length: number }> = []
+        for (const { buffer, timestamp } of chunks) {
+          for (let ch = 0; ch < full.numberOfChannels; ch++) {
+            full.copyToChannel(buffer.getChannelData(Math.min(ch, buffer.numberOfChannels - 1)), ch, offset)
+          }
+          ranges.push({ timestamp, offset, length: buffer.length })
+          offset += buffer.length
+        }
+        const denoised = denoiseBuffer(offline, full, denoise)
+        for (const { timestamp, offset: from, length } of ranges) {
+          const timelineTime = clipTimelineTimeForSource(clip, timestamp)
+          const localSpeed = speedMultiplierAt(clip, timelineTime)
+          const node = offline.createBufferSource()
+          node.buffer = denoised
+          node.playbackRate.value = localSpeed
+          node.connect(gain)
+          node.start(timelineTime, from / denoised.sampleRate, length / denoised.sampleRate)
+        }
       }
     } catch {
       // undecodable audio on this clip — skip it

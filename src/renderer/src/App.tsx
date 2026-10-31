@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useEditorStore } from './store/editorStore'
 import { useProjectStore } from './store/projectStore'
 import { PlaybackEngine } from './core/playback'
@@ -9,6 +9,8 @@ import PreviewArea from './components/preview/PreviewArea'
 import Inspector from './components/inspector/Inspector'
 import TimelineArea from './components/timeline/TimelineArea'
 import ExportModal from './components/ExportModal'
+import RestoreModal, { type RestoreCandidate } from './components/RestoreModal'
+import { totalDuration, type ProjectDocument } from '@shared/document'
 import { analyzeAssetAudio, importAssets } from './core/media/assets'
 import { KEYMAP_ACTIONS, loadKeymap, matchKeymapAction } from './lib/keymap'
 
@@ -57,20 +59,32 @@ export default function App() {
     return () => clearTimeout(id)
   }, [doc])
 
-  // Restore autosaved draft on first launch.
+  // Restore autosaved draft on first launch. The candidate lives in state and
+  // the modal renders from it — idempotent under StrictMode's double effects,
+  // unlike the old window.confirm side effect that fired twice.
+  const [restoreCandidate, setRestoreCandidate] = useState<RestoreCandidate | null>(null)
   useEffect(() => {
+    let cancelled = false
     window.api.readAutosave().then((json: string | null) => {
-      if (!json) return
+      if (!json || cancelled) return
       try {
-        const parsed = JSON.parse(json)
-        if (parsed?.tracks?.some((t: { clips: unknown[] }) => t.clips.length > 0)) {
-          const restore = window.confirm('Phát hiện dự án nháp đã lưu tự động. Khôi phục dự án đó?')
-          if (restore) useProjectStore.getState().loadDocument(parsed)
+        const parsed = JSON.parse(json) as ProjectDocument
+        const clips = (parsed?.tracks ?? []).reduce((n, t) => n + (t.clips?.length ?? 0), 0)
+        if (clips > 0) {
+          setRestoreCandidate({
+            doc: parsed,
+            name: parsed?.settings?.name ?? 'Dự án chưa lưu',
+            clips,
+            duration: totalDuration(parsed)
+          })
         }
       } catch {
         /* corrupt autosave — ignore */
       }
     })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   // Keyboard shortcuts — routed through the user keymap (see lib/keymap.ts).
@@ -206,6 +220,16 @@ export default function App() {
         </div>
       </div>
       <ExportModal />
+      {restoreCandidate && (
+        <RestoreModal
+          candidate={restoreCandidate}
+          onRestore={(doc) => {
+            useProjectStore.getState().loadDocument(doc)
+            setRestoreCandidate(null)
+          }}
+          onDismiss={() => setRestoreCandidate(null)}
+        />
+      )}
       {importNotice && (
         <div className="pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-lg bg-ink-800 px-4 py-2 text-sm text-white shadow-xl">
           {importNotice}

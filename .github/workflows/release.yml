@@ -41,6 +41,9 @@ jobs:
         run: npm run dist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Publishing is handled by the softprops release step below (with
+          # allowUpdates); the builder must not also push the same artifacts.
+          EP_PUBLISH: never
 
       - name: Read app version
         id: version
@@ -50,25 +53,29 @@ jobs:
       - name: Upload build artifacts (CI copy)
         uses: actions/upload-artifact@v4
         with:
-          name: CutClone-${{ steps.version.outputs.version }}-win-x64
+          name: EndyCut-${{ steps.version.outputs.version }}-win-x64
           path: |
             release/*.exe
+            release/*.yml
+            release/*.blockmap
           if-no-files-found: error
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
-          name: CutClone v${{ steps.version.outputs.version }}
+          name: EndyCut v${{ steps.version.outputs.version }}
           body: |
             Tải về:
-            - **CutClone-Setup-*.exe** — bản cài đặt (khuyên dùng)
-            - **CutClone-Portable-*.exe** — bản chạy trực tiếp, không cần cài
+            - **EndyCut-Setup-*.exe** — bản cài đặt (khuyên dùng, hỗ trợ tự cập nhật)
+            - **EndyCut-Portable-*.exe** — bản chạy trực tiếp, không cần cài
 
             Lưu ý: bản build chưa ký số (unsigned), Windows SmartScreen có thể
             hiện cảnh báo lần đầu chạy — chọn "More info" → "Run anyway".
           files: |
             release/*.exe
+            release/*.yml
+            release/*.blockmap
           make_latest: true
           allowUpdates: true
           replaces_artifacts: true

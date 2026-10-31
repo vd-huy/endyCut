@@ -5,6 +5,7 @@ import path from 'node:path'
 import { Readable } from 'node:stream'
 import { pathToFileURL } from 'node:url'
 import { registerMediaProtocol } from './mediaProtocol'
+import { initUpdater } from './updater'
 import {
   downloadTemplateFile,
   listCapcutDrafts,
@@ -34,7 +35,7 @@ function createWindow(): void {
     show: false,
     backgroundColor: '#0d0d12',
     autoHideMenuBar: true,
-    title: 'CutClone',
+    title: 'EndyCut',
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.mjs'),
       contextIsolation: true,
@@ -161,8 +162,8 @@ app.whenReady().then(() => {
     if (!mainWindow) return null
     const result = await dialog.showSaveDialog(mainWindow, {
       title: 'Lưu dự án',
-      defaultPath: 'du-an.cutclone.json',
-      filters: [{ name: 'CutClone Project', extensions: ['json'] }]
+      defaultPath: 'du-an.endycut.json',
+      filters: [{ name: 'EndyCut Project', extensions: ['json'] }]
     })
     return result.canceled ? null : result.filePath
   })
@@ -172,7 +173,7 @@ app.whenReady().then(() => {
     const result = await dialog.showOpenDialog(mainWindow, {
       title: 'Mở dự án',
       properties: ['openFile'],
-      filters: [{ name: 'CutClone Project', extensions: ['json'] }]
+      filters: [{ name: 'EndyCut Project', extensions: ['json'] }]
     })
     return result.canceled ? null : result.filePaths[0]
   })
@@ -358,6 +359,13 @@ app.whenReady().then(() => {
     return false
   })
 
+  // Only https URLs — the update modal links to the GitHub releases page.
+  ipcMain.handle('shell:openExternal', (_e, url: string) => {
+    if (typeof url !== 'string' || !/^https:\/\/(github\.com|api\.github\.com)\//i.test(url)) return false
+    void shell.openExternal(url)
+    return true
+  })
+
   ipcMain.handle('template:resolveLink', (_e, url: string) => resolveTemplateLink(url))
   ipcMain.handle('template:downloadFile', (_e, url: string, destPath: string) =>
     downloadTemplateFile(url, destPath)
@@ -366,6 +374,8 @@ app.whenReady().then(() => {
   ipcMain.handle('template:readDraft', (_e, folder: string) => readCapcutDraft(folder))
 
   ipcMain.handle('app:userDataPath', () => app.getPath('userData'))
+
+  initUpdater()
 
   createWindow()
 

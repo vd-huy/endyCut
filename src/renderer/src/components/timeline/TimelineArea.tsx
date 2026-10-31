@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Activity,
+  Crosshair,
   Eye,
   EyeOff,
   Flag,
@@ -11,13 +12,14 @@ import {
   Trash2,
   Volume2,
   VolumeX,
+  Waves,
   ZoomIn,
   Plus
 } from 'lucide-react'
 import { useEditorStore } from '../../store/editorStore'
 import { useProjectStore } from '../../store/projectStore'
 import type { Clip, ClipEffect, Keyframe, KeyframeEasing, Track } from '@shared/document'
-import { applyEasing, sampleKeyframes } from '@shared/document'
+import { applyEasing, createDenoiseSettings, createStabilizationSettings, sampleKeyframes } from '@shared/document'
 import { collectSnapCandidates, snapTime } from '@shared/timelineMath'
 import { formatTime } from '../../lib/format'
 import { IconButton } from '../ui/controls'
@@ -274,6 +276,31 @@ export default function TimelineArea() {
 
   const selectedClipId = selection.clipId
   const selectedIds = selection.clipIds
+  const selectedClip = selectedClipId ? useProjectStore.getState().findClip(selectedClipId) : null
+  const selectedIsVideo = selectedClip?.clip.kind === 'video'
+  const selectedHasAudio = selectedClip ? (selectedClip.clip.kind === 'video' || selectedClip.clip.kind === 'audio') : false
+
+  const toggleStabilization = () => {
+    if (!selectedClip) return
+    useProjectStore.getState().pushHistory()
+    const cur = selectedClip.clip.stabilization
+    useProjectStore.getState().updateClip(selectedClip.clip.id, {
+      stabilization: createStabilizationSettings({ enabled: !(cur?.enabled === true), level: cur?.level ?? 2 })
+    })
+  }
+
+  const toggleDenoise = () => {
+    if (!selectedClip) return
+    useProjectStore.getState().pushHistory()
+    const cur = selectedClip.clip.denoise
+    useProjectStore.getState().updateClip(selectedClip.clip.id, {
+      denoise: createDenoiseSettings({
+        enabled: !(cur?.enabled === true),
+        rate: cur?.rate ?? 0.6,
+        mode: cur?.mode ?? 'standard'
+      })
+    })
+  }
 
   const addMarkerAtPlayhead = () => {
     useProjectStore.getState().addMarker(useEditorStore.getState().playhead)
@@ -307,6 +334,25 @@ export default function TimelineArea() {
         >
           <Activity size={14} />
         </IconButton>
+        {selectedIsVideo && (
+          <IconButton
+            title="Giảm rung — bật/tắt nhanh (chỉnh mức độ trong bảng bên phải)"
+            active={selectedClip!.clip.stabilization?.enabled === true}
+            disabled={!selectedClip!.clip.assetId || !!selectedClip!.clip.compound}
+            onClick={toggleStabilization}
+          >
+            <Crosshair size={14} />
+          </IconButton>
+        )}
+        {selectedHasAudio && (
+          <IconButton
+            title="Giảm nhiễu — bật/tắt nhanh (chọn chế độ + cường độ trong bảng bên phải)"
+            active={selectedClip!.clip.denoise?.enabled === true}
+            onClick={toggleDenoise}
+          >
+            <Waves size={14} />
+          </IconButton>
+        )}
         <div className="mx-1 h-5 w-px bg-ink-700" />
         <IconButton title="Thêm track video" onClick={() => useProjectStore.getState().addTrack('video')}>
           <Plus size={14} />
@@ -541,9 +587,9 @@ function PlayheadLine({
 
   return (
     <div className="absolute top-0 z-30 h-full" style={{ left: playhead * pps }}>
-      <div className="h-full w-px bg-red-500" />
+      <div className="h-full w-px bg-white/95 shadow-[0_0_4px_rgba(0,0,0,0.6)]" />
       <div
-        className="absolute -left-1.5 -top-0.5 h-2.5 w-3 cursor-ew-resize rounded-b-sm bg-red-500"
+        className="absolute -left-1.5 -top-0.5 h-2.5 w-3 cursor-ew-resize rounded-b-sm bg-white/95 shadow-[0_0_4px_rgba(0,0,0,0.6)]"
         onPointerDown={(e) => {
           e.stopPropagation()
           dragging.current = true
@@ -904,6 +950,13 @@ function ClipContextMenu({
         const ok = project.extractAudio(clipId)
         if (!ok) window.alert('Không tách được âm thanh — cần một track âm thanh còn trống.')
       }
+    })
+    // CapCut-style quick mute: "Xóa âm thanh" silences the clip's own audio
+    // (reversible via the same menu item) without touching the video track.
+    const muted = (found.clip.volume ?? 1) === 0
+    items.push({
+      label: muted ? 'Bật lại âm thanh' : 'Xóa âm thanh (tắt tiếng)',
+      action: () => project.updateClip(clipId, { volume: muted ? 1 : 0 })
     })
   }
   items.push(

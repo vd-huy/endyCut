@@ -28,6 +28,7 @@ import {
 } from '@shared/document'
 import { overlapsTrack, resolveDropStart, splitClip } from '@shared/timelineMath'
 import { ensureProxy } from '../core/media/assets'
+import { dropStabilizationForAsset } from '../core/media/stabilization'
 import { buildReversedMediaAsset } from '../core/media/reverse'
 
 const HISTORY_LIMIT = 60
@@ -238,6 +239,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
   removeAsset(assetId) {
     get().pushHistory()
+    dropStabilizationForAsset(assetId)
     set((state) => {
       const doc = clone(state.doc)
       doc.mediaLibrary = doc.mediaLibrary.filter((a) => a.id !== assetId)

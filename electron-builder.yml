@@ -1,7 +1,7 @@
-# electron-builder configuration — Windows build for CutClone (endyCut).
+# electron-builder configuration — Windows build for EndyCut.
 # Run with: npm run dist  (uses electron-vite build output in out/)
 appId: com.huyendy.endycut
-productName: CutClone
+productName: EndyCut
 copyright: Copyright © 2026 HuyEndy
 
 directories:
@@ -19,6 +19,12 @@ asar: true
 # mediabunny/WebCodecs run in-process; no native modules need rebuilding.
 npmRebuild: false
 
+# GitHub Releases feed for electron-updater (src/main/updater.ts).
+publish:
+  provider: github
+  owner: vd-huy
+  repo: endyCut
+
 win:
   target:
     - target: nsis
@@ -35,7 +41,7 @@ nsis:
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
-  shortcutName: CutClone
+  shortcutName: EndyCut
   artifactName: ${productName}-Setup-${version}.${ext}
 
 portable:

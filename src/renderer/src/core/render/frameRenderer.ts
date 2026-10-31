@@ -1,6 +1,7 @@
 import type { Clip, ClipEffect, Compound, EffectKind, Mask, MediaAsset, ProjectDocument, TextAnimationKind, Track } from '@shared/document'
 import { clipFadeMultiplier, clipSourceTime, cssFilterString, sampleKeyframes } from '@shared/document'
 import { colorGrade } from '../color/colorGrade'
+import { getStabilizationData, kickStabilization, sampleCorrection } from '../media/stabilization'
 
 const EMOJI_FONT = `'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji',sans-serif`
 
@@ -510,17 +511,40 @@ function drawImageClip(
   const alpha = keyframed.opacity * fade * extraAlpha
   if (alpha <= 0.001) return
 
+  // Stabilization counter-transform (CapCut "Giảm rung"): shift/roll the
+  // drawn content by the smoothed−raw correction and crop in to hide borders.
+  // Analysis kicks off lazily here; until it lands the clip draws unstabilized.
+  let stabZoom = 1
+  let stabDx = 0
+  let stabDy = 0
+  let stabRot = 0
+  if (clip.stabilization?.enabled && clip.assetId && !clip.compound) {
+    const stabAsset = doc.mediaLibrary.find((a) => a.id === clip.assetId)
+    if (stabAsset) {
+      kickStabilization(clip, stabAsset)
+      const data = getStabilizationData(clip, stabAsset)
+      if (data) {
+        const corr = sampleCorrection(data, clipSourceTime(clip, time))
+        stabZoom = data.zoom
+        stabDx = corr.dx
+        stabDy = corr.dy
+        stabRot = corr.rot
+      }
+    }
+  }
+
   const mask = clip.mask
   const needsMask = !!mask && mask.shape !== 'none'
   const blend = clip.blendMode && clip.blendMode !== 'normal' ? clip.blendMode : null
 
-  const fit = Math.min(W / sw, H / sh) * keyframed.scale * eff.zoom
+  const fit = Math.min(W / sw, H / sh) * keyframed.scale * eff.zoom * stabZoom
   const dw = sw * fit
   const dh = sh * fit
   // Effect blur is calibrated at 1080p; scale with the canvas.
   const blurScale = Math.min(W, H) / 1080
-  const cx = W / 2 + keyframed.x * W + eff.dx * blurScale
-  const cy = H / 2 + keyframed.y * H + eff.dy * blurScale
+  // Corrections are fractions of the source frame; scale them like the image.
+  const cx = W / 2 + keyframed.x * W + eff.dx * blurScale + stabDx * dw
+  const cy = H / 2 + keyframed.y * H + eff.dy * blurScale + stabDy * dh
 
   const drawCore = (target: CanvasRenderingContext2D) => {
     target.save()
@@ -535,7 +559,7 @@ function drawImageClip(
       .trim()
     if (combined) target.filter = combined
     target.translate(cx, cy)
-    target.rotate((keyframed.rotation * Math.PI) / 180)
+    target.rotate(((keyframed.rotation + stabRot) * Math.PI) / 180)
     target.scale(transform.flipX ? -1 : 1, transform.flipY ? -1 : 1)
     try {
       target.drawImage(image, sx, sy, sw, sh, -dw / 2, -dh / 2, dw, dh)

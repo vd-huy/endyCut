@@ -125,6 +125,34 @@ export type AudioEffectKind =
   | 'low-pitch'
   | 'noise-reduction'
 
+/**
+ * CapCut-style realtime noise reduction, modeled on the draft's
+ * `MaterialRealtimeDenoise` (fields `is_denoise`, `denoise_rate` ∈ [0,1],
+ * `denoise_mode` ≥ 0 — see docs/re-noise-reduction-stabilization.md).
+ * CapCut's engine is ByteDance SAMI (UNet/TCN models); here a spectral-gating
+ * denoiser plays the same role with the same controls.
+ */
+export type DenoiseMode = 'standard' | 'voice' | 'music'
+
+export interface DenoiseSettings {
+  enabled: boolean
+  /** 0..1 intensity (draft key `denoise_rate`). */
+  rate: number
+  /** Draft key `denoise_mode`: what the noise profile should protect. */
+  mode: DenoiseMode
+}
+
+/**
+ * CapCut-style video stabilization, modeled on the draft's `SegmentVideo.stable`
+ * (`Stable` with int `stable_level`; 0 = off). Motion is analyzed once per clip
+ * into a per-frame correction matrix (draft: `matrix_path` + `pts_list`).
+ */
+export interface StabilizationSettings {
+  enabled: boolean
+  /** 1..4 strength (draft key `stable_level`; higher = stronger smoothing). */
+  level: number
+}
+
 /** One point of a speed-ramp curve: timeline progress t (0..1) → speed multiplier v. */
 export interface SpeedCurvePoint {
   t: number
@@ -332,6 +360,10 @@ export interface Clip {
   chromaKey?: ChromaKey
   /** Audio processing applied in preview (partial) and export (full). */
   audioEffect?: AudioEffectKind
+  /** CapCut-style noise reduction (draft `MaterialRealtimeDenoise`). */
+  denoise?: DenoiseSettings
+  /** CapCut-style video stabilization (draft `SegmentVideo.stable`). */
+  stabilization?: StabilizationSettings
   /** CapCut-style visual effects applied over time ranges of this clip. */
   effects?: ClipEffect[]
   text?: TextStyle
@@ -478,6 +510,16 @@ export function createChromaKey(partial: Partial<ChromaKey> = {}): ChromaKey {
 
 export function createTextAnimation(): TextAnimation {
   return { in: 'none', out: 'none', duration: 0.5 }
+}
+
+/** CapCut "Giảm nhiễu" defaults: off, standard mode, mid strength. */
+export function createDenoiseSettings(partial: Partial<DenoiseSettings> = {}): DenoiseSettings {
+  return { enabled: false, rate: 0.6, mode: 'standard', ...partial }
+}
+
+/** CapCut "Giảm rung" defaults: off, level 2 of 4. */
+export function createStabilizationSettings(partial: Partial<StabilizationSettings> = {}): StabilizationSettings {
+  return { enabled: false, level: 2, ...partial }
 }
 
 export function createText(): TextStyle {
@@ -767,6 +809,8 @@ export function normalizeDocument(input: ProjectDocument): ProjectDocument {
         mask: clip.mask ?? { ...DEFAULT_MASK },
         chromaKey: clip.chromaKey ?? { ...DEFAULT_CHROMA_KEY },
         audioEffect: clip.audioEffect ?? 'none',
+        denoise: clip.denoise ?? undefined,
+        stabilization: clip.stabilization ?? undefined,
         audioNormalize: clip.audioNormalize ?? false,
         colorAdvanced: clip.colorAdvanced ?? { enabled: false },
         compound: clip.compound ?? undefined

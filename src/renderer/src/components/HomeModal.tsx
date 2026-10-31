@@ -56,7 +56,7 @@ export default function HomeModal({ onClose }: { onClose: () => void }) {
         <div className="mb-5 flex items-center justify-between">
           <div className="flex items-center gap-2 text-white">
             <Clapperboard size={22} className="text-accent" />
-            <h2 className="text-lg font-semibold">CutClone</h2>
+            <h2 className="text-lg font-semibold">EndyCut</h2>
           </div>
           <button onClick={onClose} className="text-ink-400 hover:text-white">
             <X size={18} />

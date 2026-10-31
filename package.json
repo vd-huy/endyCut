@@ -1,10 +1,14 @@
 {
   "name": "endyCut",
   "productName": "EndyCut",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Trình dựng video desktop — EndyCut",
   "main": "./out/main/index.js",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vd-huy/endyCut.git"
+  },
   "author": "HuyEndy",
   "license": "MIT",
   "private": true,
@@ -19,6 +23,7 @@
     "dist:dir": "electron-vite build && electron-builder --windows --dir"
   },
   "dependencies": {
+    "electron-updater": "^6.8.11",
     "lucide-react": "^1.61.0",
     "mediabunny": "^1.62.1",
     "react": "^19.3.1",

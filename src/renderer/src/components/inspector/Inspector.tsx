@@ -1,5 +1,5 @@
 import { Combine, Diamond, FlipHorizontal2, FlipVertical2, Music, RotateCcw, Save, Scissors, Snowflake, Sparkles, Trash2, Ungroup, Undo2 } from 'lucide-react'
-import { useMemo, useReducer, useRef, useState } from 'react'
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { useEditorStore } from '../../store/editorStore'
 import { useProjectStore } from '../../store/projectStore'
 import {
@@ -7,13 +7,16 @@ import {
   SPEED_CURVE_PRESETS,
   createChromaKey,
   createColorAdvanced,
+  createDenoiseSettings,
   createMask,
+  createStabilizationSettings,
   loudnessGain,
   type AudioEffectKind,
   type BlendMode,
   type Clip,
   type ColorAdvanced,
   type CurvePoint,
+  type DenoiseMode,
   type MaskShape,
   type TextAnimationKind
 } from '@shared/document'
@@ -21,6 +24,7 @@ import { Section, SliderRow } from '../ui/controls'
 import { FONT_FAMILIES, TRANSITION_TYPES } from '../../lib/presets'
 import { formatTime } from '../../lib/format'
 import { freezeFrameAtPlayhead } from '../../core/media/freezeFrame'
+import { ensureStabilization, getStabilizationData } from '../../core/media/stabilization'
 import {
   deleteAudioPreset,
   deleteColorPreset,
@@ -154,6 +158,7 @@ export default function Inspector() {
       {(clip.kind === 'video' || clip.kind === 'image') && (
         <>
           <TransformSection clip={clip} />
+          {clip.kind === 'video' && <StabilizationSection clip={clip} />}
           <KeyframeSection clip={clip} />
           <FilterSection clip={clip} />
           <ColorAdvancedSection clip={clip} />
@@ -167,6 +172,7 @@ export default function Inspector() {
 
       {(clip.kind === 'video' || clip.kind === 'audio') && (
         <>
+          <DenoiseSection clip={clip} />
           <AudioSection clip={clip} />
           <AudioEffectSection clip={clip} />
         </>
@@ -1158,6 +1164,160 @@ function TransitionQuickSection({ clip }: { clip: Clip }) {
             setTransition(clip.id, { ...clip.transitionIn!, duration: v })
           }
         />
+      )}
+    </Section>
+  )
+}
+
+const DENOISE_MODES: Array<{ id: DenoiseMode; name: string; hint: string }> = [
+  { id: 'standard', name: 'Tiêu chuẩn', hint: 'Cân bằng cho mọi loại âm' },
+  { id: 'voice', name: 'Giọng nói', hint: 'Bảo vệ dải giọng nói, lọc mạnh tiếng ồn' },
+  { id: 'music', name: 'Nhạc', hint: 'Nhẹ tay để giữ nguyên nhạc cụ' }
+]
+
+/**
+ * CapCut "Giảm rung": analyzes the clip's camera motion once, then
+ * counter-applies a smoothed transform at render time (draft `stable`).
+ */
+function StabilizationSection({ clip }: { clip: Clip }) {
+  const update = useProjectStore.getState().updateClip
+  const push = useProjectStore.getState().pushHistory
+  const doc = useProjectStore.getState().doc
+  const asset = clip.assetId ? doc.mediaLibrary.find((a) => a.id === clip.assetId) : null
+  const stab = clip.stabilization
+  const enabled = stab?.enabled === true && clip.kind === 'video' && !!asset && asset.kind === 'video'
+  const level = stab?.level ?? 2
+  const [status, setStatus] = useState<'idle' | 'analyzing' | 'ready' | 'failed'>('idle')
+  const [progress, setProgress] = useState(0)
+
+  useEffect(() => {
+    if (!enabled || !asset) {
+      setStatus('idle')
+      return
+    }
+    const cached = getStabilizationData(clip, asset)
+    if (cached) {
+      setStatus('ready')
+      return
+    }
+    let cancelled = false
+    setStatus('analyzing')
+    setProgress(0)
+    ensureStabilization(clip, asset, (p) => {
+      if (!cancelled) setProgress(p)
+    })
+      .then((result) => {
+        if (!cancelled) setStatus(result ? 'ready' : 'failed')
+      })
+      .catch(() => {
+        if (!cancelled) setStatus('failed')
+      })
+    return () => {
+      cancelled = true
+    }
+    // Analyze on settings/range changes; the analyzer dedupes concurrent runs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, asset?.id, level, clip.inPoint, clip.duration, clip.speed])
+
+  const data = enabled && asset ? getStabilizationData(clip, asset) : null
+  return (
+    <Section title="Giảm rung">
+      <label className="flex items-center justify-between text-xs">
+        <span className="text-ink-300">Ổn định hình ảnh</span>
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => {
+            push()
+            update(clip.id, { stabilization: createStabilizationSettings({ enabled: e.target.checked, level }) })
+          }}
+          className="accent-[#4f7cff]"
+        />
+      </label>
+      {enabled && (
+        <>
+          <SliderRow
+            label="Mức độ"
+            value={level}
+            min={1}
+            max={4}
+            step={1}
+            format={(v) => `Cấp ${v}`}
+            onCommitStart={push}
+            onChange={(v) => update(clip.id, { stabilization: { enabled: true, level: v } })}
+          />
+          <p className="text-[10px] text-ink-500">
+            {status === 'analyzing' && `Đang phân tích rung lắc… ${Math.round(progress * 100)}%`}
+            {status === 'ready' && data && `Sẵn sàng — crop-in ${Math.round((data.zoom - 1) * 100)}% để che viền.`}
+            {status === 'failed' && 'Không phân tích được clip này (video quá ngắn hoặc lỗi giải mã).'}
+            {status === 'idle' && 'Sẵn sàng phân tích khi phát/xuất.'}
+          </p>
+          <p className="text-[10px] leading-relaxed text-ink-500">
+            Phân tích chuyển động máy quay từng khung, làm mượt quỹ đạo theo mức đã chọn rồi bù ngược — giống
+            CapCut (draft <code>stable</code>/<code>stable_level</code>).
+          </p>
+        </>
+      )}
+    </Section>
+  )
+}
+
+/** CapCut "Giảm nhiễu" (draft `MaterialRealtimeDenoise`). */
+function DenoiseSection({ clip }: { clip: Clip }) {
+  const update = useProjectStore.getState().updateClip
+  const push = useProjectStore.getState().pushHistory
+  const dn = clip.denoise
+  const enabled = dn?.enabled === true
+  const rate = dn?.rate ?? 0.6
+  const mode: DenoiseMode = dn?.mode ?? 'standard'
+  return (
+    <Section title="Giảm nhiễu">
+      <label className="flex items-center justify-between text-xs">
+        <span className="text-ink-300">Lọc tiếng ồn (AI)</span>
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => {
+            push()
+            update(clip.id, { denoise: createDenoiseSettings({ enabled: e.target.checked, rate, mode }) })
+          }}
+          className="accent-[#4f7cff]"
+        />
+      </label>
+      {enabled && (
+        <>
+          <div className="flex gap-1">
+            {DENOISE_MODES.map((m) => (
+              <button
+                key={m.id}
+                title={m.hint}
+                onClick={() => {
+                  push()
+                  update(clip.id, { denoise: { enabled: true, rate, mode: m.id } })
+                }}
+                className={`flex-1 rounded bg-ink-800 py-1 text-[11px] hover:bg-ink-700 ${
+                  mode === m.id ? 'text-accent' : 'text-ink-300'
+                }`}
+              >
+                {m.name}
+              </button>
+            ))}
+          </div>
+          <SliderRow
+            label="Cường độ"
+            value={rate}
+            min={0}
+            max={1}
+            step={0.05}
+            format={(v) => `${Math.round(v * 100)}%`}
+            onCommitStart={push}
+            onChange={(v) => update(clip.id, { denoise: { enabled: true, rate: v, mode } })}
+          />
+          <p className="text-[10px] leading-relaxed text-ink-500">
+            Nghe trước trực tiếp và áp dụng đầy đủ khi xuất (draft CapCut: <code>denoise_rate</code> 0–1,{' '}
+            <code>denoise_mode</code>).
+          </p>
+        </>
       )}
     </Section>
   )

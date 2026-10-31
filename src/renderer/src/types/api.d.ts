@@ -1,8 +1,8 @@
-import type { CutCloneApi } from '../../../preload'
+import type { EndyCutApi } from '../../../preload'
 
 declare global {
   interface Window {
-    api: CutCloneApi
+    api: EndyCutApi
   }
 }
 

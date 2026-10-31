@@ -34,7 +34,25 @@ export interface RecentProjectEntry {
   openedAt: number
 }
 
-export interface CutCloneApi {
+export type UpdateStatus =
+  | 'idle'
+  | 'checking'
+  | 'available'
+  | 'not-available'
+  | 'downloading'
+  | 'downloaded'
+  | 'error'
+
+export interface UpdateState {
+  supported: boolean
+  status: UpdateStatus
+  currentVersion: string
+  availableVersion: string | null
+  progressPercent: number | null
+  error: string | null
+}
+
+export interface EndyCutApi {
   /** Native file picker for media; returns absolute paths. */
   pickMediaFiles(): Promise<string[]>
   /** Size in bytes of a local media file. */
@@ -82,10 +100,18 @@ export interface CutCloneApi {
   readCapcutDraft(folder: string): Promise<{ content: string; meta: string | null }>
   /** App data folder root — template downloads live under templates/. */
   getUserDataPath(): Promise<string>
+  /** GitHub Releases auto-update (supported:false in dev). */
+  updatesGetState(): Promise<UpdateState>
+  updatesCheck(): Promise<UpdateState>
+  updatesDownload(): Promise<UpdateState>
+  updatesInstall(): Promise<boolean>
+  onUpdateState(cb: (state: UpdateState) => void): () => void
+  /** Open an external URL in the system browser. */
+  openExternal(url: string): Promise<boolean>
   platform: string
 }
 
-const api: CutCloneApi = {
+const api: EndyCutApi = {
   pickMediaFiles: () => ipcRenderer.invoke('media:pickFiles'),
   mediaFileSize: (path) => ipcRenderer.invoke('media:fileSize', path),
   mediaReadSlice: (path, start, length) => ipcRenderer.invoke('media:readSlice', path, start, length),
@@ -123,6 +149,16 @@ const api: CutCloneApi = {
   listCapcutDrafts: () => ipcRenderer.invoke('template:listDrafts'),
   readCapcutDraft: (folder) => ipcRenderer.invoke('template:readDraft', folder),
   getUserDataPath: () => ipcRenderer.invoke('app:userDataPath'),
+  updatesGetState: () => ipcRenderer.invoke('updates:getState'),
+  updatesCheck: () => ipcRenderer.invoke('updates:check'),
+  updatesDownload: () => ipcRenderer.invoke('updates:download'),
+  updatesInstall: () => ipcRenderer.invoke('updates:install'),
+  onUpdateState: (cb) => {
+    const listener = (_e: Electron.IpcRendererEvent, state: UpdateState): void => cb(state)
+    ipcRenderer.on('updates:state', listener)
+    return () => ipcRenderer.removeListener('updates:state', listener)
+  },
+  openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
   platform: process.platform
 }
 

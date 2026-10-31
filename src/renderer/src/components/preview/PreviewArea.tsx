@@ -52,8 +52,14 @@ export default function PreviewArea({ engine }: { engine: PlaybackEngine }) {
         />
       </div>
 
-      <div className="flex shrink-0 flex-col items-center gap-1 border-t border-ink-700/60 bg-ink-900 px-4 py-2">
-        <div className="flex items-center gap-1">
+      <div className="grid shrink-0 grid-cols-3 items-center border-t border-ink-700/60 bg-ink-900 px-4 py-2">
+        <div className="flex items-center gap-2 text-xs tabular-nums">
+          <span className="text-white">{formatTime(playhead)}</span>
+          <span className="text-ink-600">/</span>
+          <span className="text-ink-400">{formatTime(duration)}</span>
+        </div>
+
+        <div className="flex items-center justify-center gap-1">
           <IconButton title="Về đầu" onClick={() => engine.seek(0)}>
             <ChevronFirst size={17} />
           </IconButton>
@@ -70,9 +76,9 @@ export default function PreviewArea({ engine }: { engine: PlaybackEngine }) {
           <button
             onClick={toggle}
             title="Phát/Dừng (Space)"
-            className="mx-1 flex h-10 w-10 items-center justify-center rounded-full bg-accent text-white hover:bg-accent-soft"
+            className="mx-2 flex h-9 w-9 items-center justify-center rounded-full bg-white text-black shadow-md hover:bg-neutral-200"
           >
-            {playing ? <Pause size={18} /> : <Play size={18} className="ml-0.5" />}
+            {playing ? <Pause size={17} /> : <Play size={17} className="ml-0.5" />}
           </button>
           <IconButton
             title="Tới 1 khung hình"
@@ -87,6 +93,9 @@ export default function PreviewArea({ engine }: { engine: PlaybackEngine }) {
           <IconButton title="Tới cuối" onClick={() => engine.seek(duration)}>
             <ChevronLast size={17} />
           </IconButton>
+        </div>
+
+        <div className="flex items-center justify-end gap-2">
           <IconButton
             title="Lặp lại"
             active={loop}
@@ -97,12 +106,7 @@ export default function PreviewArea({ engine }: { engine: PlaybackEngine }) {
           >
             <Repeat size={15} />
           </IconButton>
-        </div>
-        <div className="flex items-center gap-2 text-xs tabular-nums text-ink-300">
-          <span className="text-white">{formatTime(playhead)}</span>
-          <span className="text-ink-600">/</span>
-          <span>{formatTime(duration)}</span>
-          <span className="ml-3 rounded bg-ink-800 px-1.5 py-0.5 text-[10px] text-ink-400">
+          <span className="rounded bg-ink-800 px-1.5 py-0.5 text-[10px] tabular-nums text-ink-400">
             {doc.settings.width}×{doc.settings.height} · {doc.settings.fps}fps
           </span>
         </div>
